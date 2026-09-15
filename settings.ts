@@ -7,7 +7,12 @@
  * `before_provider_request`.
  *
  * Store file: ~/.pi/agent/volcengine-gateway.json
- *   { "version": 1, "cacheRetention": "long" | "short", "updatedAt": "..." }
+ *   { "version": 1, "cacheRetention": "long" | "short",
+ *     "baseUrl": "https://…/v1", "updatedAt": "..." }
+ *
+ * `baseUrl` is a persisted endpoint override (same role as planOpenAI/
+ * planAnthropic in pi-alibaba-models): $VOLCEAPI_BASE_URL env wins over it,
+ * the built-in default applies when neither is set.
  *
  * `cacheRetention: "long"` makes the payload hook inject
  * `prompt_cache_retention: "24h"` (+ `prompt_cache_key` on chat routes) for
@@ -28,6 +33,8 @@ export type CacheRetentionMode = "long" | "short";
 export interface VolcengineSettings {
 	version: 1;
 	cacheRetention: CacheRetentionMode;
+	/** Persisted endpoint override; undefined = built-in default. */
+	baseUrl?: string;
 	updatedAt?: string;
 }
 
@@ -45,9 +52,11 @@ export function loadSettings(file: string = settingsPath()): VolcengineSettings 
 		if (!existsSync(file)) return { ...DEFAULT_SETTINGS };
 		const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<VolcengineSettings> | null;
 		if (!parsed || typeof parsed !== "object" || parsed.version !== 1) return { ...DEFAULT_SETTINGS };
+		const baseUrl = typeof parsed.baseUrl === "string" ? normalizeBaseUrl(parsed.baseUrl) : undefined;
 		return {
 			version: 1,
 			cacheRetention: parsed.cacheRetention === "long" ? "long" : "short",
+			...(baseUrl ? { baseUrl } : {}),
 			...(typeof parsed.updatedAt === "string" ? { updatedAt: parsed.updatedAt } : {}),
 		};
 	} catch {
@@ -55,14 +64,39 @@ export function loadSettings(file: string = settingsPath()): VolcengineSettings 
 	}
 }
 
+/**
+ * Validates + normalizes a candidate endpoint URL: http(s) only, no inner
+ * whitespace, parseable, trailing slashes stripped. Returns undefined when
+ * the value is unusable (same "never trust stored junk" stance as the store).
+ */
+export function normalizeBaseUrl(value: string | undefined | null): string | undefined {
+	const trimmed = (value ?? "").trim();
+	if (!trimmed) return undefined;
+	if (!/^https?:\/\//i.test(trimmed)) return undefined;
+	if (/\s/.test(trimmed)) return undefined;
+	try {
+		new URL(trimmed);
+	} catch {
+		return undefined;
+	}
+	return trimmed.replace(/\/+$/, "");
+}
+
 export function saveSettings(
-	patch: { cacheRetention?: CacheRetentionMode },
+	patch: { cacheRetention?: CacheRetentionMode; baseUrl?: string | null },
 	file: string = settingsPath(),
 ): VolcengineSettings {
 	const current = loadSettings(file);
+	let baseUrl = current.baseUrl;
+	if (patch.baseUrl === null) {
+		baseUrl = undefined; // explicit clear (`url reset`)
+	} else if (patch.baseUrl !== undefined) {
+		baseUrl = normalizeBaseUrl(patch.baseUrl) ?? baseUrl;
+	}
 	const next: VolcengineSettings = {
 		version: 1,
 		cacheRetention: patch.cacheRetention ?? current.cacheRetention,
+		...(baseUrl ? { baseUrl } : {}),
 		updatedAt: new Date().toISOString(),
 	};
 	mkdirSync(dirname(file), { recursive: true });
@@ -157,6 +191,16 @@ export function volcengineCommands(): CommandSpec[] {
 				{ name: "on", description: "Inject prompt_cache_retention:24h on supported models" },
 				{ name: "off", description: "Only pi's default caching (PI_CACHE_RETENTION still applies)" },
 				{ name: "status", description: "Show current cache mode and supported routes" },
+			],
+		},
+		{
+			name: "url",
+			description: "Endpoint URL override: probe and persist a custom gateway base URL",
+			args: [
+				{ name: "status", description: "Effective endpoint + source (env/settings/default)" },
+				{ name: "set", description: "Probe, then persist a custom base URL (bare `set` prompts in the TUI)" },
+				{ name: "check", description: "Probe a URL (or the effective one) without saving" },
+				{ name: "reset", description: "Clear the saved override" },
 			],
 		},
 		{

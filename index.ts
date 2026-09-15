@@ -3,7 +3,9 @@
  *
  * Endpoint: per-subscriber API Gateway URL, e.g.
  *           https://<id>.apigateway-cn-beijing.volceapi.com/v1
- *           (override with $VOLCEAPI_BASE_URL)
+ *           (override with $VOLCEAPI_BASE_URL, or persist one via
+ *           `/volcengine url set https://…` — the candidate is probed
+ *           before saving, like pi-alibaba-models' endpoint detection)
  * Auth:     `pi /login volcengine-gateway` (key is validated against the
  *           gateway before it is saved, stored in ~/.pi/agent/auth.json)
  *           or $VOLCEAPI_API_KEY.
@@ -100,6 +102,7 @@ import {
 	completeArgs,
 	formatCommandLine,
 	loadSettings,
+	normalizeBaseUrl,
 	parseCacheArg,
 	saveSettings,
 	settingsPath,
@@ -118,10 +121,28 @@ const KEY_VALIDATION_TIMEOUT_MS = 12_000;
 /** Timeout for the GET /models catalog fetch. */
 const FETCH_TIMEOUT_MS = 10_000;
 
-export function resolveBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
-	const override = env[BASE_URL_ENV]?.trim();
+/**
+ * Effective endpoint: $VOLCEAPI_BASE_URL env > persisted settings override
+ * (`/volcengine url set`) > built-in default. Same precedence stance as
+ * pi-alibaba-models' resolvePlanEndpoints (explicit source beats config,
+ * config beats default).
+ */
+export function resolveBaseUrl(
+	env: NodeJS.ProcessEnv = process.env,
+	settings?: { baseUrl?: string },
+): string {
+	const override = env[BASE_URL_ENV]?.trim() || settings?.baseUrl?.trim();
 	if (override) return override.replace(/\/+$/, "");
 	return DEFAULT_BASE_URL;
+}
+
+export function baseUrlSource(
+	env: NodeJS.ProcessEnv = process.env,
+	settings?: { baseUrl?: string },
+): "env" | "settings" | "default" {
+	if (env[BASE_URL_ENV]?.trim()) return "env";
+	if (settings?.baseUrl?.trim()) return "settings";
+	return "default";
 }
 
 type GatewayApi = "openai-responses" | "openai-completions";
@@ -586,6 +607,73 @@ export async function validateGatewayKey(key: string, options: ValidateKeyOption
 	}
 }
 
+// ---------------------------------------------------------------------------
+// endpoint detection (probe before switching — pi-alibaba-models pattern)
+// ---------------------------------------------------------------------------
+
+const ENDPOINT_PROBE_TIMEOUT_MS = 8_000;
+
+export type EndpointProbe =
+	| { status: "ok"; models: number }
+	/** Alive, but demanded auth and no key was supplied. */
+	| { status: "reachable" }
+	/** Alive, but rejected the supplied key (401/403). */
+	| { status: "auth" }
+	/** Answered, but not like a gateway /v1/models listing. */
+	| { status: "unexpected"; reason: string }
+	| { status: "unreachable"; reason?: string };
+
+/**
+ * Cheap GET proving a candidate endpoint resolves and serves the key —
+ * `GET {url}/models`. 200 + `{data:[…]}` ⇒ ok; 401/403 ⇒ alive but the key
+ * is not accepted there (or missing); anything else is classified, never
+ * thrown. Does not log the key.
+ */
+export async function probeBaseUrl(
+	url: string,
+	options: { apiKey?: string; fetchImpl?: typeof fetch; signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<EndpointProbe> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? ENDPOINT_PROBE_TIMEOUT_MS);
+	const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+	try {
+		const headers: Record<string, string> = {};
+		if (options.apiKey) headers.Authorization = `Bearer ${options.apiKey}`;
+		const response = await (options.fetchImpl ?? fetch)(`${url}/models`, { headers, signal });
+		if (response.status === 401 || response.status === 403) {
+			return options.apiKey ? { status: "auth" } : { status: "reachable" };
+		}
+		if (!response.ok) return { status: "unexpected", reason: `HTTP ${response.status}` };
+		const data = (await response.json().catch(() => null)) as { data?: unknown } | null;
+		if (!data || !Array.isArray(data.data)) {
+			return { status: "unexpected", reason: "response is not a /v1/models listing" };
+		}
+		return { status: "ok", models: data.data.length };
+	} catch (error) {
+		return { status: "unreachable", reason: error instanceof Error ? error.message : String(error) };
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+export function describeProbe(probe: EndpointProbe, url: string): { message: string; type: "info" | "warning" | "error" } {
+	switch (probe.status) {
+		case "ok":
+			return { message: `${url} is LIVE — GET /models returned ${probe.models} models with the current key.`, type: "info" };
+		case "reachable":
+			return {
+				message: `${url} is reachable but demands a key (401 before auth). No key resolved — set one to verify fully.`,
+				type: "warning",
+			};
+		case "auth":
+			return { message: `${url} is reachable but REJECTED the current key (401/403).`, type: "error" };
+		case "unexpected":
+			return { message: `${url} responded unexpectedly: ${probe.reason}.`, type: "warning" };
+		case "unreachable":
+			return { message: `${url} did not respond: ${probe.reason ?? "network error"}.`, type: "error" };
+	}
+}
+
 async function promptValidatedGatewayKey(
 	interaction: ProviderAuthInteraction,
 	options: ValidateKeyOptions,
@@ -759,6 +847,9 @@ export interface VolcCtx {
 	ui: {
 		notify(message: string, type?: "info" | "warning" | "error"): void;
 		setStatus(key: string, text: string | undefined): void;
+		input(title: string, placeholder?: string): Promise<string | undefined>;
+		select(title: string, options: string[]): Promise<string | undefined>;
+		confirm(title: string, message: string): Promise<boolean>;
 	};
 	model: { id: string; provider: string; api?: string } | undefined;
 	signal: AbortSignal | undefined;
@@ -774,6 +865,9 @@ export interface VolcCtx {
 		}): Promise<{ aborted: boolean; errors: ReadonlyMap<string, Error> }>;
 	};
 	sessionManager?: { getSessionId(): string };
+	/** Present in real pi: reruns the extension so the provider picks up the
+	 *  new endpoint (same mechanism pi-alibaba-models uses after URL edits). */
+	reload?: () => Promise<void>;
 }
 
 export interface VolcengineExtensionOptions {
@@ -795,6 +889,10 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 		return { mode: settings.cacheRetention, source: "settings" };
 	}
 
+	function endpoint(): { url: string; source: "env" | "settings" | "default" } {
+		return { url: resolveBaseUrl(process.env, settings), source: baseUrlSource(process.env, settings) };
+	}
+
 	function updateStatusWidget(ctx: VolcCtx): void {
 		if (!ctx.hasUI) return;
 		const model = ctx.model;
@@ -807,7 +905,7 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 		ctx.ui.setStatus(STATUS_KEY, `volc:cache-${mode}${note}`);
 	}
 
-	pi.registerProvider(createVolcengineGatewayProvider({ fetchImpl }));
+	pi.registerProvider(createVolcengineGatewayProvider({ baseUrl: endpoint().url, fetchImpl }));
 
 	pi.on("before_provider_request", (event, ctx) => {
 		let payload: unknown = event.payload;
@@ -851,7 +949,7 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 		ctx.ui.notify(
 			[
 				"volcengine-gateway",
-				`base URL: ${resolveBaseUrl()}`,
+				`base URL: ${endpoint().url} (${endpoint().source})`,
 				auth.configured
 					? `key: configured (${auth.source ?? "unknown source"})`
 					: "key: MISSING — /login volcengine-gateway or $VOLCEAPI_API_KEY",
@@ -906,7 +1004,7 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 			return;
 		}
 		ctx.ui.notify("Checking key against the gateway (zero-inference probe)…", "info");
-		const result = await validateGatewayKey(key, { baseUrl: resolveBaseUrl(), fetchImpl, signal: ctx.signal });
+		const result = await validateGatewayKey(key, { baseUrl: endpoint().url, fetchImpl, signal: ctx.signal });
 		if (result.status === "valid") {
 			ctx.ui.notify("Gateway key is VALID (authenticated; 400 model-field probe).", "info");
 		} else if (result.status === "invalid") {
@@ -943,15 +1041,134 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 		}
 	};
 
+	const cmdUrl = async (args: string, ctx: VolcCtx): Promise<void> => {
+		const parts = args.trim().split(/\s+/).filter(Boolean);
+		const sub = (parts[0] ?? "status").toLowerCase();
+		const value = parts.slice(1).join(" ");
+
+		if (sub === "status") {
+			const ep = endpoint();
+			ctx.ui.notify(
+				[
+					`endpoint: ${ep.url}`,
+					`source: ${ep.source}${ep.source === "env" ? ` ($${BASE_URL_ENV})` : ep.source === "settings" ? ` (${settingsFile})` : " (built-in)"}`,
+					settings.baseUrl && ep.source === "env" ? `saved override (shadowed by env): ${settings.baseUrl}` : "",
+					`default: ${DEFAULT_BASE_URL}`,
+					"probe with: /volcengine url check [https://…]",
+				]
+					.filter(Boolean)
+					.join("\n"),
+				"info",
+			);
+			return;
+		}
+
+		if (sub === "reset") {
+			if (!settings.baseUrl) {
+				ctx.ui.notify(`No saved endpoint override — already using ${endpoint().url} (${endpoint().source}).`, "info");
+				return;
+			}
+			settings = saveSettings({ baseUrl: null }, settingsFile);
+			const ep = endpoint();
+			ctx.ui.notify(`Override cleared — now using ${ep.url} (${ep.source}).`, "info");
+			await applyEndpointChange(ctx);
+			return;
+		}
+
+		if (sub !== "set" && sub !== "check") {
+			ctx.ui.notify(
+				sub === "url" || !sub
+					? "Usage: url [status|set <https://…>|check <https://…>|reset]"
+					: `Unknown url subcommand "${sub}" — use: status, set, check, reset`,
+				"warning",
+			);
+			return;
+		}
+
+		let candidate = value;
+		if (!candidate) {
+			if (sub === "check") {
+				candidate = endpoint().url; // bare `url check` probes the effective endpoint
+			} else if (!ctx.hasUI) {
+				ctx.ui.notify("Usage: url set <https://…> (interactive prompt needs the TUI)", "warning");
+				return;
+			} else {
+				candidate = (await ctx.ui.input("Volcengine gateway base URL:", endpoint().url)) ?? "";
+			}
+		}
+		const normalized = normalizeBaseUrl(candidate);
+		if (!normalized) {
+			ctx.ui.notify(
+				`Invalid endpoint URL ${JSON.stringify(candidate.trim())} — expected https://… (e.g. https://<id>.apigateway-cn-beijing.volceapi.com/v1)`,
+				"warning",
+			);
+			return;
+		}
+		if (sub === "set" && normalized === endpoint().url && endpoint().source !== "settings") {
+			// Same URL the env/default already provides: nothing to persist.
+			ctx.ui.notify(`${normalized} is already the effective endpoint (${endpoint().source}) — nothing to save.`, "info");
+			return;
+		}
+
+		// Detection: probe the candidate with the resolved key before switching.
+		const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+		ctx.ui.notify(`Probing ${normalized} …`, "info");
+		const probe = await probeBaseUrl(normalized, { apiKey, fetchImpl, signal: ctx.signal });
+
+		if (sub === "check") {
+			const described = describeProbe(probe, normalized);
+			ctx.ui.notify(described.message, described.type);
+			return;
+		}
+
+		if (probe.status === "ok") {
+			settings = saveSettings({ baseUrl: normalized }, settingsFile);
+			ctx.ui.notify(`Endpoint verified (GET /models → 200, ${probe.models} models) and saved to ${settingsFile}.`, "info");
+			await applyEndpointChange(ctx);
+			return;
+		}
+
+		const described = describeProbe(probe, normalized);
+		const question = `${described.message} Save it anyway?`;
+		if (!ctx.hasUI) {
+			ctx.ui.notify(`${question} (answer in the TUI, or export ${BASE_URL_ENV}=${normalized})`, described.type);
+			return;
+		}
+		const save = await ctx.ui.confirm("Unverified endpoint", question);
+		if (!save) {
+			ctx.ui.notify("Endpoint NOT saved — keeping " + endpoint().url, "info");
+			return;
+		}
+		settings = saveSettings({ baseUrl: normalized }, settingsFile);
+		ctx.ui.notify(`Saved WITHOUT verification to ${settingsFile}.`, "warning");
+		await applyEndpointChange(ctx);
+	};
+
+	async function applyEndpointChange(ctx: VolcCtx): Promise<void> {
+		if (process.env[BASE_URL_ENV]?.trim()) {
+			ctx.ui.notify(`Note: $${BASE_URL_ENV} env override takes precedence over the saved setting.`, "warning");
+		}
+		try {
+			if (ctx.reload) {
+				await ctx.reload();
+				return;
+			}
+		} catch {
+			// reload unavailable (e.g. `pi -e` quick-test mode) — fall through
+		}
+		ctx.ui.notify("Saved. Restart pi (or run /reload) to bind the provider to the new endpoint.", "info");
+	}
+
 	const runners: Record<string, (args: string, ctx: VolcCtx) => Promise<void>> = {
 		status: cmdStatus,
 		cache: cmdCache,
+		url: cmdUrl,
 		keys: cmdKeys,
 		models: cmdModels,
 	};
 
 	pi.registerCommand("volcengine", {
-		description: "Volcengine gateway settings: status, cache retention, key check, catalog refresh",
+		description: "Volcengine gateway settings: status, cache retention, endpoint URL, key check, catalog refresh",
 		getArgumentCompletions: (prefix: string) => completeArgs(prefix, volcengineCommands()),
 		handler: async (args: string, ctx: VolcCtx) => {
 			const trimmed = (args ?? "").trim();

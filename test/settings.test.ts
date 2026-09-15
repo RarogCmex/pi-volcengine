@@ -10,8 +10,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import extension, {
+	BASE_URL_ENV,
+	baseUrlSource,
+	DEFAULT_BASE_URL,
+	describeProbe,
 	NO_RETENTION_MODELS,
 	PROVIDER_ID,
+	probeBaseUrl,
+	resolveBaseUrl,
 	RETENTION_MODELS,
 	type VolcCtx,
 } from "../index.ts";
@@ -21,6 +27,7 @@ import {
 	completeArgs,
 	DEFAULT_SETTINGS,
 	loadSettings,
+	normalizeBaseUrl,
 	parseCacheArg,
 	saveSettings,
 	settingsPath,
@@ -93,6 +100,13 @@ function fakeCtx(overrides: Record<string, unknown> = {}) {
 	const notifications: { message: string; type?: string }[] = [];
 	const statuses: { key: string; text: string | undefined }[] = [];
 	const refreshCalls: unknown[] = [];
+	const dialogs = {
+		inputCalls: [] as { title: string; placeholder?: string }[],
+		confirmCalls: [] as { title: string; message: string }[],
+		reloadCalls: 0,
+		inputResponse: undefined as string | undefined,
+		confirmResponse: true,
+	};
 	const ctx: VolcCtx = {
 		hasUI: false,
 		ui: {
@@ -101,6 +115,17 @@ function fakeCtx(overrides: Record<string, unknown> = {}) {
 			},
 			setStatus(key: string, text: string | undefined) {
 				statuses.push({ key, text });
+			},
+			async input(title: string, placeholder?: string) {
+				dialogs.inputCalls.push({ title, placeholder });
+				return dialogs.inputResponse;
+			},
+			async select() {
+				return undefined;
+			},
+			async confirm(title: string, message: string) {
+				dialogs.confirmCalls.push({ title, message });
+				return dialogs.confirmResponse;
 			},
 		},
 		model: undefined,
@@ -118,9 +143,12 @@ function fakeCtx(overrides: Record<string, unknown> = {}) {
 			},
 		},
 		sessionManager: { getSessionId: () => "sess-42" },
+		reload: async () => {
+			dialogs.reloadCalls += 1;
+		},
 		...overrides,
 	} as VolcCtx;
-	return { ctx, notifications, statuses, refreshCalls };
+	return { ctx, notifications, statuses, refreshCalls, dialogs };
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +258,7 @@ test("retention sets derived from catalog compat flags", () => {
 test("completeArgs: first level, nested level, misses", () => {
 	const commands = volcengineCommands();
 	const all = completeArgs("", commands)!;
-	assert.deepEqual(all.map((i) => i.value).sort(), ["cache ", "keys ", "models ", "status "].sort());
+	assert.deepEqual(all.map((i) => i.value).sort(), ["cache ", "keys ", "models ", "status ", "url "].sort());
 	assert.match(all.find((i) => i.value === "cache ")!.label, /^cache \[on\|off\|status\]/);
 
 	assert.deepEqual(completeArgs("st", commands)!.map((i) => i.value), ["status "]);
@@ -458,4 +486,283 @@ test("settings file is created on first save with defaults intact", () => {
 	const saved: VolcengineSettings = saveSettings({ cacheRetention: "long" }, file);
 	assert.equal(saved.version, 1);
 	assert.match(readFileSync(file, "utf8"), /"cacheRetention": "long"/);
+});
+
+// ---------------------------------------------------------------------------
+// endpoint URL override + detection
+// ---------------------------------------------------------------------------
+
+const GOOD_URL = "https://gw.example.volceapi.com/v1";
+
+test("normalizeBaseUrl matrix", () => {
+	assert.equal(normalizeBaseUrl(" https://a.b/v1// "), "https://a.b/v1");
+	assert.equal(normalizeBaseUrl("http://a.b/v1"), "http://a.b/v1");
+	assert.equal(normalizeBaseUrl("HTTP://A.B/v1"), "HTTP://A.B/v1"); // scheme case preserved
+	assert.equal(normalizeBaseUrl("ftp://a.b"), undefined);
+	assert.equal(normalizeBaseUrl("a.b/v1"), undefined); // no scheme
+	assert.equal(normalizeBaseUrl("https://a.b/v 1"), undefined); // inner space
+	assert.equal(normalizeBaseUrl("https://not a url"), undefined);
+	assert.equal(normalizeBaseUrl(""), undefined);
+	assert.equal(normalizeBaseUrl(null), undefined);
+	assert.equal(normalizeBaseUrl(undefined), undefined);
+});
+
+test("settings store round-trips baseUrl; junk dropped; null clears", () => {
+	const file = tmpSettingsFile();
+	const saved = saveSettings({ baseUrl: `${GOOD_URL}/` }, file);
+	assert.equal(saved.baseUrl, GOOD_URL, "trailing slash normalized");
+	assert.equal(loadSettings(file).baseUrl, GOOD_URL);
+	// junk in file is dropped on load, not fatal
+	const junkFile = tmpSettingsFile({ version: 1, cacheRetention: "short", baseUrl: "ftp://x" });
+	assert.equal(loadSettings(junkFile).baseUrl, undefined);
+	// null clears, other fields preserved
+	saveSettings({ cacheRetention: "long" }, file);
+	const cleared = saveSettings({ baseUrl: null }, file);
+	assert.equal(cleared.baseUrl, undefined);
+	assert.equal(cleared.cacheRetention, "long", "cache setting untouched by url clear");
+});
+
+test("resolveBaseUrl precedence: env > settings > default", () => {
+	const settings = { baseUrl: GOOD_URL };
+	assert.equal(resolveBaseUrl({}, settings), GOOD_URL);
+	assert.equal(resolveBaseUrl({ [BASE_URL_ENV]: "https://env.example/v1/" }, settings), "https://env.example/v1");
+	assert.equal(resolveBaseUrl({}, {}), DEFAULT_BASE_URL);
+	assert.equal(resolveBaseUrl({}, undefined), DEFAULT_BASE_URL);
+	assert.equal(baseUrlSource({ [BASE_URL_ENV]: "https://env.example/v1" }, settings), "env");
+	assert.equal(baseUrlSource({}, settings), "settings");
+	assert.equal(baseUrlSource({}, {}), "default");
+	// whitespace-only env does not count
+	assert.equal(baseUrlSource({ [BASE_URL_ENV]: "   " }, settings), "settings");
+});
+
+test("probeBaseUrl classifies gateway responses without throwing", async () => {
+	const ok = fetchStub({ status: 200, body: { object: "list", data: [{ id: "a" }, { id: "b" }] } });
+	const r1 = await probeBaseUrl(GOOD_URL, { apiKey: "k", fetchImpl: ok.impl });
+	assert.deepEqual(r1, { status: "ok", models: 2 });
+	assert.equal(ok.calls[0]!.url, `${GOOD_URL}/models`);
+	assert.equal((ok.calls[0]!.init?.headers as Record<string, string>).Authorization, "Bearer k");
+
+	const denied = fetchStub({ status: 401 });
+	assert.deepEqual(await probeBaseUrl(GOOD_URL, { apiKey: "k", fetchImpl: denied.impl }), { status: "auth" });
+	assert.deepEqual(await probeBaseUrl(GOOD_URL, { fetchImpl: denied.impl }), { status: "reachable" }, "no key + 401 = alive");
+
+	const bad = fetchStub({ status: 200, body: { hello: "world" } });
+	const r2 = await probeBaseUrl(GOOD_URL, { apiKey: "k", fetchImpl: bad.impl });
+	assert.equal(r2.status, "unexpected");
+
+	const serverErr = fetchStub({ status: 502 });
+	assert.deepEqual(await probeBaseUrl(GOOD_URL, { apiKey: "k", fetchImpl: serverErr.impl }), {
+		status: "unexpected",
+		reason: "HTTP 502",
+	});
+
+	const offline = fetchStub(new Error("connect ENETUNREACH"));
+	const r3 = await probeBaseUrl(GOOD_URL, { apiKey: "k", fetchImpl: offline.impl });
+	assert.equal(r3.status, "unreachable");
+	assert.match((r3 as { reason?: string }).reason!, /ENETUNREACH/);
+});
+
+test("describeProbe maps status to message/type", () => {
+	assert.equal(describeProbe({ status: "ok", models: 15 }, GOOD_URL).type, "info");
+	assert.match(describeProbe({ status: "ok", models: 15 }, GOOD_URL).message, /LIVE — GET \/models returned 15/);
+	assert.equal(describeProbe({ status: "reachable" }, GOOD_URL).type, "warning");
+	assert.equal(describeProbe({ status: "auth" }, GOOD_URL).type, "error");
+	assert.match(describeProbe({ status: "auth" }, GOOD_URL).message, /REJECTED/);
+	assert.equal(describeProbe({ status: "unexpected", reason: "HTTP 502" }, GOOD_URL).type, "warning");
+	assert.equal(describeProbe({ status: "unreachable" }, GOOD_URL).type, "error");
+});
+
+test("provider + status + keys check honor the persisted endpoint", async () => {
+	const file = tmpSettingsFile({ version: 1, cacheRetention: "short", baseUrl: GOOD_URL });
+	const { impl, calls } = fetchStub({ status: 400 });
+	const fake = loadExtension({ settingsFile: file, fetchImpl: impl });
+	const provider = fake.providers.get(PROVIDER_ID) as { baseUrl: string; getModels(): { baseUrl: string }[] };
+	assert.equal(provider.baseUrl, GOOD_URL, "provider bound to settings URL");
+	assert.equal(provider.getModels()[0]!.baseUrl, GOOD_URL, "models baked with settings URL");
+
+	const handler = fake.commands.get("volcengine")!.handler;
+	const { ctx, notifications } = fakeCtx();
+	await handler("status", ctx as never);
+	assert.match(notifications[0]!.message, new RegExp(`base URL: ${GOOD_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} \\(settings\\)`));
+
+	await handler("keys check", ctx as never);
+	assert.equal(calls[0]!.url, `${GOOD_URL}/responses`, "key probe uses settings URL");
+});
+
+test("/volcengine url status shows source and env shadowing", async () => {
+	const file = tmpSettingsFile({ version: 1, cacheRetention: "short", baseUrl: GOOD_URL });
+	const fake = loadExtension({ settingsFile: file });
+	const handler = fake.commands.get("volcengine")!.handler;
+
+	const { ctx, notifications } = fakeCtx();
+	await handler("url status", ctx as never);
+	assert.match(notifications[0]!.message, /endpoint: https:\/\/gw\.example\.volceapi\.com\/v1/);
+	assert.match(notifications[0]!.message, /source: settings/);
+	assert.match(notifications[0]!.message, new RegExp(`default: ${DEFAULT_BASE_URL.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}`));
+
+	// bare `url` == status
+	await handler("url", ctx as never);
+	assert.match(notifications[1]!.message, /endpoint:/);
+
+	// env shadows the saved override and says so
+	process.env[BASE_URL_ENV] = "https://env.example/v1";
+	try {
+		await handler("url status", ctx as never);
+		const msg = notifications[2]!.message;
+		assert.match(msg, /endpoint: https:\/\/env\.example\/v1/);
+		assert.match(msg, /source: env/);
+		assert.match(msg, new RegExp(`saved override \\(shadowed by env\\): ${GOOD_URL.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}`));
+	} finally {
+		delete process.env[BASE_URL_ENV];
+	}
+});
+
+test("/volcengine url check probes without saving", async () => {
+	const file = tmpSettingsFile();
+	const { impl, calls } = fetchStub({ status: 200, body: { data: [{ id: "m1" }] } });
+	const fake = loadExtension({ settingsFile: file, fetchImpl: impl });
+	const handler = fake.commands.get("volcengine")!.handler;
+	const { ctx, notifications, dialogs } = fakeCtx();
+
+	await handler(`url check ${GOOD_URL}/`, ctx as never);
+	assert.equal(calls[0]!.url, `${GOOD_URL}/models`, "normalized before probing");
+	assert.match(notifications[0]!.message, /Probing/);
+	assert.match(notifications[1]!.message, /LIVE — GET \/models returned 1 models/);
+	assert.equal(loadSettings(file).baseUrl, undefined, "nothing persisted");
+	assert.equal(dialogs.reloadCalls, 0);
+
+	// check without argument probes the effective endpoint
+	await handler("url check", ctx as never);
+	assert.equal(calls[1]!.url, `${DEFAULT_BASE_URL}/models`);
+});
+
+test("/volcengine url set: verified save + reload; already-effective no-op", async () => {
+	const file = tmpSettingsFile();
+	const { impl } = fetchStub({ status: 200, body: { data: [{ id: "m1" }, { id: "m2" }, { id: "m3" }] } });
+	const fake = loadExtension({ settingsFile: file, fetchImpl: impl });
+	const handler = fake.commands.get("volcengine")!.handler;
+	const { ctx, notifications, dialogs } = fakeCtx();
+
+	await handler(`url set ${GOOD_URL}`, ctx as never);
+	assert.equal(loadSettings(file).baseUrl, GOOD_URL);
+	assert.match(notifications.at(-1)!.message, /verified \(GET \/models → 200, 3 models\) and saved/);
+	assert.equal(dialogs.reloadCalls, 1, "extension reloaded so the provider rebinds");
+
+	// setting the default URL while on default is a no-op
+	const file2 = tmpSettingsFile();
+	const fake2 = loadExtension({ settingsFile: file2, fetchImpl: impl });
+	const { ctx: ctx2, notifications: n2, dialogs: d2 } = fakeCtx();
+	await fake2.commands.get("volcengine")!.handler(`url set ${DEFAULT_BASE_URL}/`, ctx2 as never);
+	assert.match(n2.at(-1)!.message, /already the effective endpoint \(default\) — nothing to save/);
+	assert.equal(loadSettings(file2).baseUrl, undefined);
+	assert.equal(d2.reloadCalls, 0);
+});
+
+test("/volcengine url set: rejected/unreachable probes go through confirm", async () => {
+	// 401 with a key -> auth status -> confirm gate
+	const denied = fetchStub({ status: 401 });
+	const file = tmpSettingsFile();
+	const fake = loadExtension({ settingsFile: file, fetchImpl: denied.impl });
+	const handler = fake.commands.get("volcengine")!.handler;
+
+	const yes = fakeCtx({ hasUI: true });
+	yes.dialogs.confirmResponse = true;
+	await handler(`url set ${GOOD_URL}`, yes.ctx as never);
+	assert.equal(yes.dialogs.confirmCalls.length, 1);
+	assert.match(yes.dialogs.confirmCalls[0]!.message, /REJECTED the current key/);
+	assert.match(yes.dialogs.confirmCalls[0]!.message, /Save it anyway\?$/);
+	assert.equal(loadSettings(file).baseUrl, GOOD_URL, "saved after confirm");
+	assert.match(yes.notifications.at(-1)!.message, /Saved WITHOUT verification/);
+	assert.equal(yes.dialogs.reloadCalls, 1);
+
+	// decline -> not saved
+	const no = fakeCtx({ hasUI: true });
+	no.dialogs.confirmResponse = false;
+	const file2 = tmpSettingsFile();
+	const fake2 = loadExtension({ settingsFile: file2, fetchImpl: denied.impl });
+	await fake2.commands.get("volcengine")!.handler(`url set ${GOOD_URL}`, no.ctx as never);
+	assert.equal(loadSettings(file2).baseUrl, undefined);
+	assert.match(no.notifications.at(-1)!.message, /NOT saved/);
+
+	// headless (no UI): cannot confirm -> instructs, does not save
+	const file3 = tmpSettingsFile();
+	const fake3 = loadExtension({ settingsFile: file3, fetchImpl: fetchStub(new Error("offline")).impl });
+	const headless = fakeCtx();
+	await fake3.commands.get("volcengine")!.handler(`url set ${GOOD_URL}`, headless.ctx as never);
+	assert.equal(loadSettings(file3).baseUrl, undefined);
+	assert.match(headless.notifications.at(-1)!.message, /did not respond/);
+	assert.match(headless.notifications.at(-1)!.message, new RegExp(`answer in the TUI, or export ${BASE_URL_ENV}=`));
+});
+
+test("/volcengine url set: invalid URL and interactive prompt paths", async () => {
+	const file = tmpSettingsFile();
+	const fake = loadExtension({ settingsFile: file });
+	const handler = fake.commands.get("volcengine")!.handler;
+
+	const { ctx, notifications } = fakeCtx();
+	await handler("url set ftp://bad", ctx as never);
+	assert.equal(notifications[0]!.type, "warning");
+	assert.match(notifications[0]!.message, /Invalid endpoint URL "ftp:\/\/bad"/);
+
+	// bare `set` without UI -> usage hint
+	await handler("url set", ctx as never);
+	assert.match(notifications[1]!.message, /interactive prompt needs the TUI/);
+
+	// bare `set` with UI -> input dialog prefilled with current endpoint
+	const { impl } = fetchStub({ status: 200, body: { data: [] } });
+	const fake2 = loadExtension({ settingsFile: file, fetchImpl: impl });
+	const tui = fakeCtx({ hasUI: true });
+	tui.dialogs.inputResponse = `${GOOD_URL}/`;
+	await fake2.commands.get("volcengine")!.handler("url set", tui.ctx as never);
+	assert.equal(tui.dialogs.inputCalls.length, 1);
+	assert.equal(tui.dialogs.inputCalls[0]!.placeholder, DEFAULT_BASE_URL);
+	assert.equal(loadSettings(file).baseUrl, GOOD_URL, "prompted value normalized + saved");
+
+	// cancelled dialog -> nothing happens
+	const tui2 = fakeCtx({ hasUI: true });
+	tui2.dialogs.inputResponse = undefined;
+	await fake2.commands.get("volcengine")!.handler("url set", tui2.ctx as never);
+	assert.match(tui2.notifications.at(-1)!.message, /Invalid endpoint URL ""/);
+
+	await handler("url bogus", ctx as never);
+	assert.match(notifications.at(-1)!.message, /Unknown url subcommand "bogus"/);
+});
+
+test("/volcengine url reset clears override and reloads", async () => {
+	const file = tmpSettingsFile({ version: 1, cacheRetention: "short", baseUrl: GOOD_URL });
+	const fake = loadExtension({ settingsFile: file });
+	const handler = fake.commands.get("volcengine")!.handler;
+	const { ctx, notifications, dialogs } = fakeCtx();
+
+	await handler("url reset", ctx as never);
+	assert.equal(loadSettings(file).baseUrl, undefined);
+	assert.match(notifications[0]!.message, new RegExp(`Override cleared — now using ${DEFAULT_BASE_URL.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")} \\(default\\)`));
+	assert.equal(dialogs.reloadCalls, 1);
+
+	// idempotent second reset
+	await handler("url reset", ctx as never);
+	assert.match(notifications[1]!.message, /No saved endpoint override/);
+	assert.equal(dialogs.reloadCalls, 1, "no reload when nothing changed");
+});
+
+test("url subcommands appear in autocomplete", () => {
+	const commands = volcengineCommands();
+	assert.deepEqual(completeArgs("u", commands)!.map((i) => i.value), ["url "]);
+	const nested = completeArgs("url", commands)!;
+	assert.deepEqual(nested.map((i) => i.value), ["url status", "url set", "url check", "url reset"]);
+	assert.deepEqual(completeArgs("url s", commands)!.map((i) => i.value), ["url status", "url set"]);
+	// free-form URL after `set` disables completion
+	assert.equal(completeArgs(`url set ${GOOD_URL}`, commands), null);
+});
+
+test("env override wins over persisted settings end-to-end", () => {
+	process.env[BASE_URL_ENV] = "https://env.example/v1";
+	try {
+		const file = tmpSettingsFile({ version: 1, cacheRetention: "short", baseUrl: GOOD_URL });
+		const fake = loadExtension({ settingsFile: file });
+		const provider = fake.providers.get(PROVIDER_ID) as { baseUrl: string };
+		assert.equal(provider.baseUrl, "https://env.example/v1");
+	} finally {
+		delete process.env[BASE_URL_ENV];
+	}
 });

@@ -48,12 +48,15 @@ export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com
 
 | Команда | Действие |
 |---|---|
-| `/volcengine status` | Base URL, источник ключа (stored/env), режим кэша, размер каталога, текущая модель |
-| `/volcengine cache on\|off\|status` | 24h prompt-cache retention без глобального `PI_CACHE_RETENTION=long`: хук инжектит `prompt_cache_retention:"24h"` (+ `prompt_cache_key` на chat-маршрутах) только в 12 проверенных маршруты; 3 строгие модели не трогаются никогда. Настройка сохраняется в файл и подхватывается мгновенно |
+| `/volcengine status` | Base URL (+ источник: env/settings/default), источник ключа (stored/env), режим кэша, размер каталога, текущая модель |
+| `/volcengine cache on\|off\|status` | 24h prompt-cache retention без глобального `PI_CACHE_RETENTION=long`: хук инжектит `prompt_cache_retention:"24h"` (+ `prompt_cache_key` на chat-маршрутах) только в 12 проверенных маршрутов; 3 строгие модели не трогаются никогда. Настройка сохраняется в файл и подхватывается мгновенно |
+| `/volcengine url status\|set\|check\|reset` | Оверрайд Endpoint URL + детект по образцу pi-alibaba-models. Приоритет: `$VOLCEAPI_BASE_URL` > сохранённый `baseUrl` > встроенный. `set <https://…>` сначала делает пробу `GET /models` текущим ключом: 200+листинг → сохраняет без вопросов; 401/403 или недоступность → confirm «Save anyway?» (в headless-режиме не сохраняет вовсе). `check [url]` — проба без сохранения, `reset` — сброс оверрайда. После сохранения — `ctx.reload()`, чтобы провайдер перепривязался к новому URL |
 | `/volcengine keys check` | Валидация текущего ключа zero-inference зондом (400 = валиден, 401/403 = отклонён, сеть недоступна = статус неизвестен) |
 | `/volcengine models refresh` | Принудительный `GET /v1/models` (force, provider-scoped) → слияние с каталогом → persist в `~/.pi/agent/models-store.json` |
 
 Приоритет режима кэша: `PI_CACHE_RETENTION=long` (env) > настройка `/volcengine cache`. Если pi уже отправил `prompt_cache_retention` (env-режим), хук ничего не добавляет. Виджет в status-баре: `volc:cache-long` (+ `(n/a)`, если текущая модель не принимает 24h); обновляется на `session_start`, `model_select`, `thinking_level_select`.
+
+Файл настроек: `~/.pi/agent/volcengine-gateway.json` — `{ version, cacheRetention, baseUrl?, updatedAt }`; битый/чужой файл безопасно деградирует в дефолты.
 
 ## Модели
 
@@ -127,10 +130,10 @@ export PI_CACHE_RETENTION=long   # глобально для всех прова
 
 ```bash
 npm install
-npm run check        # tsc --noEmit + tsx --test (56 офлайн-тестов: каталог, хуки,
+npm run check        # tsc --noEmit + tsx --test (70 офлайн-тестов: каталог, хуки,
                      # merge/fetch, retention-матрица на уровне payload,
-                     # store настроек, /volcengine-команды, виджет,
-                     # валидация ключа, login-флоу, check/resolve)
+                     # store настроек, /volcengine-команды, endpoint-оверрайд
+                     # и probe-детект, виджет, валидация ключа, login-флоу)
 ```
 
 Быстрый E2E (тратит кредиты подписки):
