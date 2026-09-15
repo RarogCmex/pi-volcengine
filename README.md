@@ -24,7 +24,16 @@ pi install git:<repo>@main               # из git
 /login volcengine-gateway
 ```
 
-Расширение попросит consumer-ключ шлюза (UUID) и **проверит его до сохранения** zero-inference зондом (`POST {} → /responses`: 400 = ключ прошёл аутентификацию, 401 = отклонён). Неверный ключ → повторный ввод; шлюз недоступен → выбор «retry / сохранить без проверки». Ключ ляжет в `~/.pi/agent/auth.json`.
+Расширение попросит consumer-ключ шлюза (UUID) и **проверит его до сохранения** zero-inference зондом (`POST {} → /responses`: 400 = ключ прошёл аутентификацию, 401 = отклонён). Ключ ляжет в `~/.pi/agent/auth.json`.
+
+**Смена Endpoint URL прямо во время login** (стартуем с дефолтного URL, предлагаем сменить на кастомный — у каждой подписки свой gateway-id, и валидный ключ чужой подписки на дефолтном шлюзе даст 401):
+
+- **401/403** → выбор: «Re-enter the API key» / «Change the endpoint URL…»;
+- **шлюз недоступен** → «Retry validation» / «Change the endpoint URL…» / «Save without validating»;
+- в ветке смены URL: ввод `https://<gateway-id>.apigateway-<region>.volceapi.com/v1` → проба `GET /models` введённым ключом → 200 сохраняется молча; иначе выбор «Use it anyway / Enter a different URL… / Keep current»; пустой ввод = остаться на текущем; Esc = отмена login;
+- принятый URL пишется в `~/.pi/agent/volcengine-gateway.json`, провайдер и все модели **перепривязываются in-place** (pi хранит те же ссылки на объекты моделей — `/reload` не нужен), и ключ тут же переоверяется против нового шлюза.
+
+Обнаружить чужой gateway-id автоматически нельзя — Volcengine не публикует discovery-API для подписчиков, поэтому детект здесь = валидация кандидата пробой, а не поиск.
 
 **Вариант 2 — переменная окружения:**
 
@@ -50,7 +59,7 @@ export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com
 |---|---|
 | `/volcengine status` | Base URL (+ источник: env/settings/default), источник ключа (stored/env), режим кэша, размер каталога, текущая модель |
 | `/volcengine cache on\|off\|status` | 24h prompt-cache retention без глобального `PI_CACHE_RETENTION=long`: хук инжектит `prompt_cache_retention:"24h"` (+ `prompt_cache_key` на chat-маршрутах) только в 12 проверенных маршрутов; 3 строгие модели не трогаются никогда. Настройка сохраняется в файл и подхватывается мгновенно |
-| `/volcengine url status\|set\|check\|reset` | Оверрайд Endpoint URL + детект по образцу pi-alibaba-models. Приоритет: `$VOLCEAPI_BASE_URL` > сохранённый `baseUrl` > встроенный. `set <https://…>` сначала делает пробу `GET /models` текущим ключом: 200+листинг → сохраняет без вопросов; 401/403 или недоступность → confirm «Save anyway?» (в headless-режиме не сохраняет вовсе). `check [url]` — проба без сохранения, `reset` — сброс оверрайда. После сохранения — `ctx.reload()`, чтобы провайдер перепривязался к новому URL |
+| `/volcengine url status\|set\|check\|reset` | Оверрайд Endpoint URL + детект по образцу pi-alibaba-models. Приоритет: `$VOLCEAPI_BASE_URL` > сохранённый `baseUrl` > встроенный. `set <https://…>` сначала делает пробу `GET /models` текущим ключом: 200+листинг → сохраняет без вопросов; 401/403 или недоступность → confirm «Save anyway?» (в headless-режиме не сохраняет вовсе). `check [url]` — проба без сохранения, `reset` — сброс оверрайда. Сохранение перепривязывает провайдер и модели in-place (pi хранит те же ссылки на объекты моделей — `/reload` не нужен) |
 | `/volcengine keys check` | Валидация текущего ключа zero-inference зондом (400 = валиден, 401/403 = отклонён, сеть недоступна = статус неизвестен) |
 | `/volcengine models refresh` | Принудительный `GET /v1/models` (force, provider-scoped) → слияние с каталогом → persist в `~/.pi/agent/models-store.json` |
 
@@ -130,7 +139,7 @@ export PI_CACHE_RETENTION=long   # глобально для всех прова
 
 ```bash
 npm install
-npm run check        # tsc --noEmit + tsx --test (70 офлайн-тестов: каталог, хуки,
+npm run check        # tsc --noEmit + tsx --test (76 офлайн-тестов: каталог, хуки,
                      # merge/fetch, retention-матрица на уровне payload,
                      # store настроек, /volcengine-команды, endpoint-оверрайд
                      # и probe-детект, виджет, валидация ключа, login-флоу)

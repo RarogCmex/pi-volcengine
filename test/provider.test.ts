@@ -4,6 +4,9 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import extension, {
 	CATALOG,
@@ -21,6 +24,7 @@ import extension, {
 	validateGatewayKey,
 	type GatewayModelEntry,
 } from "../index.ts";
+import { loadSettings } from "../settings.ts";
 
 // ---------------------------------------------------------------------------
 // fake pi harness
@@ -64,9 +68,15 @@ function createFakePi(): FakePi {
 	};
 }
 
+const testDir = mkdtempSync(join(tmpdir(), "volc-provider-test-"));
+let settingsCounter = 0;
+function isolatedSettingsFile(): string {
+	return join(testDir, `settings-${settingsCounter++}.json`);
+}
+
 function loadExtension(): FakePi {
 	const fake = createFakePi();
-	(extension as any)(fake.pi);
+	(extension as any)(fake.pi, { settingsFile: isolatedSettingsFile() });
 	return fake;
 }
 
@@ -668,12 +678,135 @@ test("login: validates the key and stores it", async () => {
 test("login: re-prompts after an invalid key", async () => {
 	const { impl, calls } = fetchStub([{ status: 401 }, { status: 400 }]);
 	const provider = createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl: impl });
-	const { interaction, prompts, notices } = fakeInteraction(["bad-key", "good-key"]);
+	const { interaction, prompts, notices } = fakeInteraction(["bad-key", "rekey", "good-key"]);
 	const credential = await provider.auth.apiKey!.login!(interaction as any);
 	assert.deepEqual(credential, { type: "api_key", key: "good-key" });
 	assert.equal(prompts.filter((p) => p.type === "secret").length, 2);
 	assert.equal(calls.length, 2);
 	assert.ok(notices.some((n) => n.message.includes("rejected")), "rejection notification");
+});
+
+// ── login-time endpoint switching (variant B) ──────────────────────────
+
+type LoginProvider = ReturnType<typeof createVolcengineGatewayProvider>;
+
+function loginProvider(fetchImpl: typeof fetch, settingsFile?: string): LoginProvider {
+	return createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl, settingsFile });
+}
+
+test("login: 401 → change endpoint → probe ok → persisted, rebound, key re-validated", async () => {
+	const settingsFile = isolatedSettingsFile();
+	const { impl, calls } = fetchStub([
+		{ status: 401 }, // validate key against the default URL
+		{ status: 200, body: { data: [{ id: "m1" }] } }, // probe the candidate with the key
+		{ status: 400 }, // re-validate the key against the new URL
+	]);
+	const provider = loginProvider(impl, settingsFile);
+	const { interaction, prompts, notices } = fakeInteraction(["my-key", "reurl", "https://gw2.example/v1/"]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.deepEqual(credential, { type: "api_key", key: "my-key" });
+	assert.deepEqual(prompts.map((p) => p.type), ["secret", "select", "text"]);
+	assert.equal(calls[1]!.url, "https://gw2.example/v1/models", "candidate normalized before probing");
+	assert.equal(calls[2]!.url, "https://gw2.example/v1/responses", "key re-validated against the new URL");
+	assert.equal(loadSettings(settingsFile).baseUrl, "https://gw2.example/v1", "endpoint persisted");
+	assert.equal((provider as any).baseUrl, "https://gw2.example/v1", "provider rebound in-place");
+	assert.ok(provider.getModels().every((m) => m.baseUrl === "https://gw2.example/v1"), "all models rebound");
+	assert.ok(notices.some((n) => n.message.includes("Endpoint verified")));
+});
+
+test("login: empty custom URL keeps the current endpoint", async () => {
+	const settingsFile = isolatedSettingsFile();
+	const { impl, calls } = fetchStub([{ status: 401 }, { status: 400 }]);
+	const provider = loginProvider(impl, settingsFile);
+	const { interaction, prompts } = fakeInteraction(["k1", "reurl", "  ", "k2"]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.equal(credential.key, "k2");
+	assert.deepEqual(prompts.map((p) => p.type), ["secret", "select", "text", "secret"]);
+	assert.deepEqual(calls.map((c) => c.url), [`${BASE}/responses`, `${BASE}/responses`], "stayed on the default URL");
+	assert.equal(loadSettings(settingsFile).baseUrl, undefined, "nothing persisted");
+	assert.equal((provider as any).baseUrl, BASE);
+});
+
+test("login: invalid URL re-prompts; unverified candidate → keep escapes back to key", async () => {
+	const settingsFile = isolatedSettingsFile();
+	const { impl, calls } = fetchStub([
+		{ status: 401 }, // default rejects k1
+		new Error("connect ENETUNREACH"), // probe of gw3 fails
+		{ status: 400 }, // default accepts k2
+	]);
+	const provider = loginProvider(impl, settingsFile);
+	const { interaction, prompts, notices } = fakeInteraction([
+		"k1",
+		"reurl",
+		"ftp://x", // invalid → re-prompt
+		"https://gw3.example/v1",
+		"keep", // probe failed → keep current
+		"k2",
+	]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.equal(credential.key, "k2");
+	assert.deepEqual(prompts.map((p) => p.type), ["secret", "select", "text", "text", "select", "secret"]);
+	assert.ok(notices.some((n) => n.message.includes("not a valid http(s) URL")));
+	assert.ok(notices.some((n) => n.message.includes("did not respond")));
+	assert.equal(loadSettings(settingsFile).baseUrl, undefined, "nothing persisted after keep");
+	assert.deepEqual(calls.map((c) => c.url), [`${BASE}/responses`, "https://gw3.example/v1/models", `${BASE}/responses`]);
+});
+
+test("login: candidate rejects the key too → try another URL → success", async () => {
+	const settingsFile = isolatedSettingsFile();
+	const { impl } = fetchStub([
+		{ status: 401 }, // default rejects
+		{ status: 401 }, // gw4 probe with key → auth (alive, wrong key there)
+		{ status: 200, body: { data: [] } }, // gw5 probe → ok
+		{ status: 400 }, // validate against gw5
+	]);
+	const provider = loginProvider(impl, settingsFile);
+	const { interaction, prompts, notices } = fakeInteraction([
+		"k1",
+		"reurl",
+		"https://gw4.example/v1",
+		"another", // gw4 rejected the key → different URL
+		"https://gw5.example/v1",
+	]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.equal(credential.key, "k1");
+	assert.deepEqual(prompts.map((p) => p.type), ["secret", "select", "text", "select", "text"]);
+	assert.ok(notices.some((n) => n.message.includes("REJECTED the current key")));
+	assert.equal(loadSettings(settingsFile).baseUrl, "https://gw5.example/v1");
+	assert.equal((provider as any).baseUrl, "https://gw5.example/v1");
+});
+
+test("login: probe auth + use anyway → saved, then key loop continues against new URL", async () => {
+	const settingsFile = isolatedSettingsFile();
+	const { impl, calls } = fetchStub([
+		{ status: 401 }, // default rejects k1
+		{ status: 401 }, // gw7 probe with k1 → auth
+		{ status: 401 }, // k1 also rejected by gw7 → invalid select again
+		{ status: 400 }, // k2 valid on gw7
+	]);
+	const provider = loginProvider(impl, settingsFile);
+	const { interaction, prompts } = fakeInteraction(["k1", "reurl", "https://gw7.example/v1", "use", "rekey", "k2"]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.equal(credential.key, "k2");
+	assert.deepEqual(prompts.map((p) => p.type), ["secret", "select", "text", "select", "select", "secret"]);
+	assert.equal(loadSettings(settingsFile).baseUrl, "https://gw7.example/v1", "saved despite unverified probe");
+	assert.equal(calls[3]!.url, "https://gw7.example/v1/responses", "rekey validated against the new URL");
+});
+
+test("login: unreachable default also offers the endpoint change", async () => {
+	const settingsFile = isolatedSettingsFile();
+	const { impl, calls } = fetchStub([
+		new Error("connect ECONNREFUSED"), // default unreachable
+		{ status: 200, body: { data: [{ id: "m" }] } }, // gw6 probe ok
+		{ status: 400 }, // validate against gw6
+	]);
+	const provider = loginProvider(impl, settingsFile);
+	const { interaction, prompts } = fakeInteraction(["k1", "reurl", "https://gw6.example/v1"]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.equal(credential.key, "k1");
+	assert.deepEqual(prompts.map((p) => p.type), ["secret", "select", "text"]);
+	assert.equal(loadSettings(settingsFile).baseUrl, "https://gw6.example/v1");
+	assert.equal(calls[2]!.url, "https://gw6.example/v1/responses");
 });
 
 test("login: unreachable gateway offers retry and save-anyway", async () => {

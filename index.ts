@@ -8,7 +8,13 @@
  *           before saving, like pi-alibaba-models' endpoint detection)
  * Auth:     `pi /login volcengine-gateway` (key is validated against the
  *           gateway before it is saved, stored in ~/.pi/agent/auth.json)
- *           or $VOLCEAPI_API_KEY.
+ *           or $VOLCEAPI_API_KEY. The login flow starts on the effective
+ *           endpoint and, when the key is rejected (401 — which also happens
+ *           for a VALID key against someone else's gateway) or the gateway is
+ *           unreachable, offers "Change the endpoint URL…": the candidate is
+ *           probed with the key, persisted to the settings store on accept,
+ *           and live models are rebound in-place (pi keeps the same model
+ *           object references, so no /reload is needed).
  *
  * Priority API surface: OpenAI **Responses API** (`/responses`, stateless
  * store:false). Models whose upstream vendor does not speak Responses on this
@@ -674,38 +680,68 @@ export function describeProbe(probe: EndpointProbe, url: string): { message: str
 	}
 }
 
-async function promptValidatedGatewayKey(
+export interface CustomEndpointOptions {
+	fetchImpl?: typeof fetch;
+	/** Persist + in-place rebind once the user accepts a candidate. */
+	onPersist: (url: string) => void;
+}
+
+/**
+ * Login-flow endpoint switcher ("start on the default, offer a custom one").
+ * Prompts for a URL, probes it with the candidate key, and only persists +
+ * rebinds after the probe passes or the user explicitly accepts the verdict.
+ * Returns the new URL, or undefined to keep the current one. Cancel (Esc)
+ * rejects the prompt per the pi auth contract, aborting login.
+ */
+export async function promptCustomEndpoint(
 	interaction: ProviderAuthInteraction,
-	options: ValidateKeyOptions,
-): Promise<string> {
-	keyPrompt: while (true) {
-		const key = (await interaction.prompt({
-			type: "secret",
-			message: "Volcengine Gateway API key (volceapi.com consumer key, UUID format)",
-		})).trim();
-		if (!key) continue keyPrompt;
-		while (true) {
-			interaction.notify({ type: "progress", message: "Validating key against the gateway…" });
-			const result = await validateGatewayKey(key, { ...options, signal: interaction.signal });
-			if (result.status === "valid") {
-				interaction.notify({ type: "info", message: "API key validated." });
-				return key;
-			}
-			if (result.status === "invalid") {
-				interaction.notify({ type: "info", message: "The gateway rejected this key (401). Please re-enter it." });
-				continue keyPrompt;
-			}
-			const choice = await interaction.prompt({
-				type: "select",
-				message: `Gateway unreachable (${result.reason ?? "network error"}). What would you like to do?`,
-				options: [
-					{ id: "retry", label: "Retry validation" },
-					{ id: "save", label: "Save without validating" },
-				],
-			});
-			if (choice === "save") return key;
-			// retry: validate the same key again
+	currentUrl: string,
+	apiKey: string | undefined,
+	options: CustomEndpointOptions,
+): Promise<string | undefined> {
+	const fetchImpl = options.fetchImpl ?? fetch;
+	urlLoop: while (true) {
+		const raw = (
+			await interaction.prompt({
+				type: "text",
+				message: "Endpoint URL (https://<gateway-id>.apigateway-<region>.volceapi.com/v1) — empty to keep current",
+				placeholder: currentUrl,
+			})
+		).trim();
+		if (!raw) return undefined;
+		const normalized = normalizeBaseUrl(raw);
+		if (!normalized) {
+			interaction.notify({ type: "info", message: `"${raw}" is not a valid http(s) URL — try again.` });
+			continue urlLoop;
 		}
+		if (normalized === currentUrl) return undefined;
+		interaction.notify({ type: "progress", message: `Probing ${normalized} …` });
+		const probe = await probeBaseUrl(normalized, { apiKey, fetchImpl, signal: interaction.signal });
+		if (probe.status === "ok") {
+			options.onPersist(normalized);
+			interaction.notify({
+				type: "info",
+				message: `Endpoint verified: GET /models → 200 (${probe.models} models).`,
+			});
+			return normalized;
+		}
+		const described = describeProbe(probe, normalized);
+		interaction.notify({ type: "info", message: described.message });
+		const choice = await interaction.prompt({
+			type: "select",
+			message: "This endpoint is not verified. What next?",
+			options: [
+				{ id: "use", label: "Use it anyway", description: "Save and continue with this endpoint" },
+				{ id: "another", label: "Enter a different URL…" },
+				{ id: "keep", label: "Keep the current endpoint", description: currentUrl },
+			],
+		});
+		if (choice === "use") {
+			options.onPersist(normalized);
+			return normalized;
+		}
+		if (choice === "keep") return undefined;
+		// another → loop
 	}
 }
 
@@ -722,27 +758,107 @@ async function resolveKey(ctx: AuthContext, credential?: ApiKeyCredential) {
 // ---------------------------------------------------------------------------
 
 export interface VolcengineGatewayOptions {
+	/** Static initial URL (tests); when omitted the factory resolves
+	 *  env > settingsFile > default dynamically at every use. */
 	baseUrl?: string;
 	fetchImpl?: typeof fetch;
+	/** Settings file so the login flow can persist an endpoint switch. */
+	settingsFile?: string;
+	/** Called after login persists a new endpoint (entrypoint syncs its copy). */
+	onEndpointSaved?: (settings: VolcengineSettings) => void;
 }
 
 export function createVolcengineGatewayProvider(options: VolcengineGatewayOptions = {}) {
-	const baseUrl = options.baseUrl ?? resolveBaseUrl();
 	const fetchImpl = options.fetchImpl ?? fetch;
-	return createProvider<GatewayApi>({
+	const settingsFile = options.settingsFile;
+	let savedSettings: VolcengineSettings | undefined = settingsFile ? loadSettings(settingsFile) : undefined;
+	/** Endpoint chosen during this process (login switch / url command) —
+	 *  wins until restart, where env > settings > default applies again. */
+	let sessionOverride: string | undefined;
+
+	const currentBaseUrl = (): string =>
+		sessionOverride ?? options.baseUrl ?? resolveBaseUrl(process.env, savedSettings);
+
+	const provider = createProvider<GatewayApi>({
 		id: PROVIDER_ID,
 		name: "Volcengine API Gateway",
-		baseUrl,
+		baseUrl: currentBaseUrl(),
 		auth: {
 			apiKey: {
 				name: "Volcengine Gateway API key",
 				async login(interaction) {
+					let url = currentBaseUrl();
 					interaction.notify({
 						type: "info",
-						message: `Gateway endpoint: ${baseUrl} — use the consumer API key issued with your volceapi.com subscription (a plain Ark key will not work).`,
+						message: `Gateway endpoint: ${url} — use the consumer API key issued with your volceapi.com subscription (a plain Ark key will not work). Wrong endpoint? You can switch it below if the key is rejected.`,
 					});
-					const key = await promptValidatedGatewayKey(interaction, { baseUrl, fetchImpl });
-					return { type: "api_key", key };
+					const changeEndpoint = async (key: string): Promise<boolean> => {
+						const next = await promptCustomEndpoint(interaction, url, key, {
+							fetchImpl,
+							onPersist: persistEndpoint,
+						});
+						if (!next) return false;
+						if (process.env[BASE_URL_ENV]?.trim()) {
+							interaction.notify({
+								type: "info",
+								message: `Note: $${BASE_URL_ENV} wins again on next start; the saved endpoint applies when the env is unset. This session already uses the new one.`,
+							});
+						}
+						url = next;
+						return true;
+					};
+					keyPrompt: while (true) {
+						const key = (
+							await interaction.prompt({
+								type: "secret",
+								message: "Volcengine Gateway API key (volceapi.com consumer key, UUID format)",
+							})
+						).trim();
+						if (!key) continue keyPrompt;
+						validateLoop: while (true) {
+							interaction.notify({ type: "progress", message: `Validating key against ${url} …` });
+							const result = await validateGatewayKey(key, { baseUrl: url, fetchImpl, signal: interaction.signal });
+							if (result.status === "valid") {
+								interaction.notify({ type: "info", message: "API key validated." });
+								return { type: "api_key", key };
+							}
+							if (result.status === "invalid") {
+								// 401 can mean "wrong key" OR "right key, wrong gateway": every
+								// subscription has its own API Gateway URL.
+								const choice = await interaction.prompt({
+									type: "select",
+									message:
+										"The gateway rejected this key (401/403). A perfectly valid key is also rejected when the endpoint belongs to a different subscription — what next?",
+									options: [
+										{ id: "rekey", label: "Re-enter the API key", description: url },
+										{
+											id: "reurl",
+											label: "Change the endpoint URL…",
+											description: "Probed before saving; the key is then re-validated against it",
+										},
+									],
+								});
+								if (choice === "reurl" && (await changeEndpoint(key))) continue validateLoop;
+								continue keyPrompt; // re-enter key (also when the URL change was declined)
+							}
+							const choice = await interaction.prompt({
+								type: "select",
+								message: `Gateway unreachable (${result.reason ?? "network error"}). What would you like to do?`,
+								options: [
+									{ id: "retry", label: "Retry validation" },
+									{
+										id: "reurl",
+										label: "Change the endpoint URL…",
+										description: "Maybe the default endpoint is not yours",
+									},
+									{ id: "save", label: "Save without validating" },
+								],
+							});
+							if (choice === "save") return { type: "api_key", key };
+							if (choice === "reurl" && (await changeEndpoint(key))) continue validateLoop;
+							// retry: validate the same key against the same URL again
+						}
+					}
 				},
 				async check({ ctx, credential }) {
 					const resolved = await resolveKey(ctx, credential);
@@ -755,13 +871,36 @@ export function createVolcengineGatewayProvider(options: VolcengineGatewayOption
 				},
 			},
 		},
-		models: buildModels(baseUrl),
-		fetchModels: (context) => fetchGatewayModels(context, baseUrl, fetchImpl),
+		models: buildModels(currentBaseUrl()),
+		fetchModels: (context) => fetchGatewayModels(context, currentBaseUrl(), fetchImpl),
 		api: {
 			"openai-responses": openAIResponsesApi(),
 			"openai-completions": openAICompletionsApi(),
 		},
 	});
+
+	/**
+	 * In-place rebind: pi's Models keeps the very object references returned
+	 * by getModels() (no cloning/freezing — verified against pi-ai dist), so
+	 * mutating baseUrl redirects subsequent requests without a /reload that
+	 * the login interaction cannot trigger.
+	 */
+	function rebindBaseUrl(url: string): void {
+		sessionOverride = url;
+		(provider as { baseUrl?: string }).baseUrl = url;
+		for (const model of provider.getModels()) (model as { baseUrl: string }).baseUrl = url;
+	}
+
+	/** Persist to the settings store, rebind live models, sync the entrypoint. */
+	function persistEndpoint(url: string): void {
+		rebindBaseUrl(url);
+		if (settingsFile) {
+			savedSettings = saveSettings({ baseUrl: url }, settingsFile);
+			options.onEndpointSaved?.(savedSettings);
+		}
+	}
+
+	return Object.assign(provider, { rebindBaseUrl, persistEndpoint });
 }
 
 // ---------------------------------------------------------------------------
@@ -865,9 +1004,6 @@ export interface VolcCtx {
 		}): Promise<{ aborted: boolean; errors: ReadonlyMap<string, Error> }>;
 	};
 	sessionManager?: { getSessionId(): string };
-	/** Present in real pi: reruns the extension so the provider picks up the
-	 *  new endpoint (same mechanism pi-alibaba-models uses after URL edits). */
-	reload?: () => Promise<void>;
 }
 
 export interface VolcengineExtensionOptions {
@@ -905,7 +1041,14 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 		ctx.ui.setStatus(STATUS_KEY, `volc:cache-${mode}${note}`);
 	}
 
-	pi.registerProvider(createVolcengineGatewayProvider({ baseUrl: endpoint().url, fetchImpl }));
+	const provider = createVolcengineGatewayProvider({
+		fetchImpl,
+		settingsFile,
+		onEndpointSaved: (s) => {
+			settings = s; // keep the entrypoint copy (status/widget/endpoint) in sync
+		},
+	});
+	pi.registerProvider(provider);
 
 	pi.on("before_provider_request", (event, ctx) => {
 		let payload: unknown = event.payload;
@@ -1069,9 +1212,9 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 				return;
 			}
 			settings = saveSettings({ baseUrl: null }, settingsFile);
+			provider.rebindBaseUrl(endpoint().url);
 			const ep = endpoint();
-			ctx.ui.notify(`Override cleared — now using ${ep.url} (${ep.source}).`, "info");
-			await applyEndpointChange(ctx);
+			ctx.ui.notify(`Override cleared — now using ${ep.url} (${ep.source}), bound in-place.`, "info");
 			return;
 		}
 
@@ -1122,9 +1265,9 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 		}
 
 		if (probe.status === "ok") {
-			settings = saveSettings({ baseUrl: normalized }, settingsFile);
-			ctx.ui.notify(`Endpoint verified (GET /models → 200, ${probe.models} models) and saved to ${settingsFile}.`, "info");
-			await applyEndpointChange(ctx);
+			provider.persistEndpoint(normalized);
+			ctx.ui.notify(`Endpoint verified (GET /models → 200, ${probe.models} models), saved to ${settingsFile} and bound in-place.`, "info");
+			noteEnvShadow(ctx);
 			return;
 		}
 
@@ -1139,24 +1282,18 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 			ctx.ui.notify("Endpoint NOT saved — keeping " + endpoint().url, "info");
 			return;
 		}
-		settings = saveSettings({ baseUrl: normalized }, settingsFile);
-		ctx.ui.notify(`Saved WITHOUT verification to ${settingsFile}.`, "warning");
-		await applyEndpointChange(ctx);
+		provider.persistEndpoint(normalized);
+		ctx.ui.notify(`Saved WITHOUT verification and bound in-place.`, "warning");
+		noteEnvShadow(ctx);
 	};
 
-	async function applyEndpointChange(ctx: VolcCtx): Promise<void> {
+	function noteEnvShadow(ctx: VolcCtx): void {
 		if (process.env[BASE_URL_ENV]?.trim()) {
-			ctx.ui.notify(`Note: $${BASE_URL_ENV} env override takes precedence over the saved setting.`, "warning");
+			ctx.ui.notify(
+				`Note: $${BASE_URL_ENV} env override wins again on next start; the saved endpoint applies when the env is unset. This session already uses the saved one.`,
+				"warning",
+			);
 		}
-		try {
-			if (ctx.reload) {
-				await ctx.reload();
-				return;
-			}
-		} catch {
-			// reload unavailable (e.g. `pi -e` quick-test mode) — fall through
-		}
-		ctx.ui.notify("Saved. Restart pi (or run /reload) to bind the provider to the new endpoint.", "info");
 	}
 
 	const runners: Record<string, (args: string, ctx: VolcCtx) => Promise<void>> = {

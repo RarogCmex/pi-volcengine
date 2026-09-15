@@ -103,7 +103,6 @@ function fakeCtx(overrides: Record<string, unknown> = {}) {
 	const dialogs = {
 		inputCalls: [] as { title: string; placeholder?: string }[],
 		confirmCalls: [] as { title: string; message: string }[],
-		reloadCalls: 0,
 		inputResponse: undefined as string | undefined,
 		confirmResponse: true,
 	};
@@ -143,9 +142,6 @@ function fakeCtx(overrides: Record<string, unknown> = {}) {
 			},
 		},
 		sessionManager: { getSessionId: () => "sess-42" },
-		reload: async () => {
-			dialogs.reloadCalls += 1;
-		},
 		...overrides,
 	} as VolcCtx;
 	return { ctx, notifications, statuses, refreshCalls, dialogs };
@@ -589,6 +585,15 @@ test("provider + status + keys check honor the persisted endpoint", async () => 
 	assert.equal(calls[0]!.url, `${GOOD_URL}/responses`, "key probe uses settings URL");
 });
 
+function boundProvider(fake: FakePi) {
+	return fake.providers.get(PROVIDER_ID) as {
+		baseUrl: string;
+		rebindBaseUrl(url: string): void;
+		persistEndpoint(url: string): void;
+		getModels(): { baseUrl: string }[];
+	};
+}
+
 test("/volcengine url status shows source and env shadowing", async () => {
 	const file = tmpSettingsFile({ version: 1, cacheRetention: "short", baseUrl: GOOD_URL });
 	const fake = loadExtension({ settingsFile: file });
@@ -629,33 +634,35 @@ test("/volcengine url check probes without saving", async () => {
 	assert.match(notifications[0]!.message, /Probing/);
 	assert.match(notifications[1]!.message, /LIVE — GET \/models returned 1 models/);
 	assert.equal(loadSettings(file).baseUrl, undefined, "nothing persisted");
-	assert.equal(dialogs.reloadCalls, 0);
 
 	// check without argument probes the effective endpoint
 	await handler("url check", ctx as never);
 	assert.equal(calls[1]!.url, `${DEFAULT_BASE_URL}/models`);
 });
 
-test("/volcengine url set: verified save + reload; already-effective no-op", async () => {
+test("/volcengine url set: verified save + in-place rebind; already-effective no-op", async () => {
 	const file = tmpSettingsFile();
 	const { impl } = fetchStub({ status: 200, body: { data: [{ id: "m1" }, { id: "m2" }, { id: "m3" }] } });
 	const fake = loadExtension({ settingsFile: file, fetchImpl: impl });
 	const handler = fake.commands.get("volcengine")!.handler;
-	const { ctx, notifications, dialogs } = fakeCtx();
+	const { ctx, notifications } = fakeCtx();
 
 	await handler(`url set ${GOOD_URL}`, ctx as never);
 	assert.equal(loadSettings(file).baseUrl, GOOD_URL);
-	assert.match(notifications.at(-1)!.message, /verified \(GET \/models → 200, 3 models\) and saved/);
-	assert.equal(dialogs.reloadCalls, 1, "extension reloaded so the provider rebinds");
+	assert.match(notifications.at(-1)!.message, /verified \(GET \/models → 200, 3 models\), saved/);
+	assert.match(notifications.at(-1)!.message, /bound in-place/);
+	const provider = boundProvider(fake);
+	assert.equal(provider.baseUrl, GOOD_URL, "provider rebound without reload");
+	assert.ok(provider.getModels().every((m) => m.baseUrl === GOOD_URL), "all live models rebound");
 
 	// setting the default URL while on default is a no-op
 	const file2 = tmpSettingsFile();
 	const fake2 = loadExtension({ settingsFile: file2, fetchImpl: impl });
-	const { ctx: ctx2, notifications: n2, dialogs: d2 } = fakeCtx();
+	const { ctx: ctx2, notifications: n2 } = fakeCtx();
 	await fake2.commands.get("volcengine")!.handler(`url set ${DEFAULT_BASE_URL}/`, ctx2 as never);
 	assert.match(n2.at(-1)!.message, /already the effective endpoint \(default\) — nothing to save/);
 	assert.equal(loadSettings(file2).baseUrl, undefined);
-	assert.equal(d2.reloadCalls, 0);
+	assert.equal(boundProvider(fake2).baseUrl, DEFAULT_BASE_URL);
 });
 
 test("/volcengine url set: rejected/unreachable probes go through confirm", async () => {
@@ -673,7 +680,7 @@ test("/volcengine url set: rejected/unreachable probes go through confirm", asyn
 	assert.match(yes.dialogs.confirmCalls[0]!.message, /Save it anyway\?$/);
 	assert.equal(loadSettings(file).baseUrl, GOOD_URL, "saved after confirm");
 	assert.match(yes.notifications.at(-1)!.message, /Saved WITHOUT verification/);
-	assert.equal(yes.dialogs.reloadCalls, 1);
+	assert.equal(boundProvider(fake).baseUrl, GOOD_URL, "rebound after confirm");
 
 	// decline -> not saved
 	const no = fakeCtx({ hasUI: true });
@@ -728,21 +735,21 @@ test("/volcengine url set: invalid URL and interactive prompt paths", async () =
 	assert.match(notifications.at(-1)!.message, /Unknown url subcommand "bogus"/);
 });
 
-test("/volcengine url reset clears override and reloads", async () => {
+test("/volcengine url reset clears override and rebinds", async () => {
 	const file = tmpSettingsFile({ version: 1, cacheRetention: "short", baseUrl: GOOD_URL });
 	const fake = loadExtension({ settingsFile: file });
 	const handler = fake.commands.get("volcengine")!.handler;
-	const { ctx, notifications, dialogs } = fakeCtx();
+	const { ctx, notifications } = fakeCtx();
 
 	await handler("url reset", ctx as never);
 	assert.equal(loadSettings(file).baseUrl, undefined);
 	assert.match(notifications[0]!.message, new RegExp(`Override cleared — now using ${DEFAULT_BASE_URL.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")} \\(default\\)`));
-	assert.equal(dialogs.reloadCalls, 1);
+	assert.match(notifications[0]!.message, /bound in-place/);
+	assert.equal(boundProvider(fake).baseUrl, DEFAULT_BASE_URL, "models rebound to default");
 
 	// idempotent second reset
 	await handler("url reset", ctx as never);
 	assert.match(notifications[1]!.message, /No saved endpoint override/);
-	assert.equal(dialogs.reloadCalls, 1, "no reload when nothing changed");
 });
 
 test("url subcommands appear in autocomplete", () => {
