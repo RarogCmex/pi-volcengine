@@ -88,12 +88,33 @@ export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com
 - Chat: `reasoning_content` в стриме, `stream_options.include_usage`, `max_tokens` и `max_completion_tokens`, `strict:false` в tools, tool round-trip, prompt caching (kimi-k3 возвращал `cached_tokens`).
 - Лимиты max output получены из точных 400-ошибок шлюза; контекст qwen — из обрезки входа, hy3 — из ошибки (192 000), doubao — ошибка при >256K.
 
+## Prompt-кэш и `prompt_cache_retention`
+
+Имплицитный префикс-кэш работает на всём шлюзе: повтор промпта ~2.8k токенов с тем же `prompt_cache_key` вернул `cached_tokens` 2048–2816 (qwen3.8-flash, kimi-k2.7-code, glm-5.3-flash). pi отправляет `prompt_cache_key` (= sessionId) в каждом responses-запросе — кэш работает из коробки.
+
+Расширенное удержание `prompt_cache_retention:"24h"` pi шлёт только при `PI_CACHE_RETENTION=long` и только моделям с `supportsLongCacheRetention:true`. Проверено живьём (2026-09-15):
+
+| Маршрут | `24h` |
+|---|---|
+| deepseek-v4-pro, glm-5.3, glm-5.3-flash, qwen3.7-*/3.8-* (responses) | ✅ 200 |
+| kimi-k2.7-code, kimi-k3, MiniMax-M3, hy3, zhipu/glm-5.3 (chat) | ✅ 200 |
+| deepseek-v4-flash, doubao-seed-2.1-pro, glm-5.2 (responses) | ❌ `json: unknown field` — флаг выключен, pi им ничего не шлёт |
+
+Включить 24-часовой кэш (имеет смысл для длинных сессий с перерывами):
+
+```bash
+export PI_CACHE_RETENTION=long
+```
+
+Стоимость cache-read в каталоге тарифицируется по input-рейту (скидку кэша шлюз не публикует); `cached_tokens` из usage попадают в `usage.cacheRead` pi автоматически.
+
 ## Разработка
 
 ```bash
 npm install
-npm run check        # tsc --noEmit + tsx --test (33 офлайн-теста: каталог, хуки,
-                     # merge/fetch, валидация ключа, login-флоу, check/resolve)
+npm run check        # tsc --noEmit + tsx --test (36 офлайн-тестов: каталог, хуки,
+                     # merge/fetch, retention-матрица на уровне payload,
+                     # валидация ключа, login-флоу, check/resolve)
 ```
 
 Быстрый E2E (тратит кредиты подписки):
@@ -104,6 +125,7 @@ pi -ne -e ./index.ts -p --no-session --model volcengine-gateway/qwen3.8-flash:lo
 pi -ne -e ./index.ts -p --no-session --model volcengine-gateway/deepseek-v4-flash:high -- "Say OK"   # хук strip-summary
 pi -ne -e ./index.ts -p --no-session --model volcengine-gateway/MiniMax-M3:high -- "Say OK"          # хук adaptive
 pi -ne -e ./index.ts -p --no-session --model volcengine-gateway/kimi-k2.7-code:high -- "Say OK"      # chat-путь
+PI_CACHE_RETENTION=long pi -ne -e ./index.ts -p --model volcengine-gateway/qwen3.8-flash:low -- "Say OK"  # retention 24h
 ```
 
 Обновить каталог/цены: `pi update --models`.
@@ -116,5 +138,5 @@ pi -ne -e ./index.ts -p --no-session --model volcengine-gateway/kimi-k2.7-code:h
 
 - `encrypted_content` шлюзом не выдаётся — reasoning между ходами передаётся как summary-текст (для stateless-режима этого достаточно).
 - Контексты `glm-5.3`, `zhipu/glm-5.3`, `doubao-seed-2.1-pro`, `kimi-*`, `MiniMax-M3` взяты из эталонных Ark-расширений и проб; если реальное окно маршрута меньше, сработает авто-компакция через хук нормализации.
-- `prompt_cache_retention`/`prompt_cache_options` не отправляются (не проверены на шлюзе) — `supportsLongCacheRetention:false`.
-- Тарификация кредитов приблизительная (1 credit ≈ $1/1M токенов); точная бухгалтерия — в панели Volcengine.
+- `deepseek-v4-flash`, `doubao-seed-2.1-pro`, `glm-5.2` не принимают `prompt_cache_retention` — для них 24h-удержание недоступно (обычный кэш работает).
+- Тарификация кредитов приблизительная (1 credit ≈ $1/1M токенов, cache-read = input-рейт); точная бухгалтерия — в панели Volcengine.

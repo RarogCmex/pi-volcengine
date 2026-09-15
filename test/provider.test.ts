@@ -400,7 +400,7 @@ test("mergeGatewayCatalog refreshes names/credits and keeps verified caps", () =
 	const merged = mergeGatewayCatalog(RAW_LISTING, BASE);
 	assert.equal(merged.length, 4, "auto entry skipped");
 	const flash = merged.find((m) => m.id === "deepseek-v4-flash")!;
-	assert.deepEqual(flash.cost, { input: 0.4, output: 0.4, cacheRead: 0, cacheWrite: 0 });
+	assert.deepEqual(flash.cost, { input: 0.4, output: 0.4, cacheRead: 0.4, cacheWrite: 0 });
 	assert.equal(flash.maxTokens, 393_216, "verified cap preserved");
 	assert.equal(flash.contextWindow, 1_000_000);
 	assert.equal(flash.provider, PROVIDER_ID);
@@ -432,11 +432,39 @@ test("unknownModelConfig defaults", () => {
 	const model = unknownModelConfig("new-model", BASE, "  New Model  ", 2);
 	assert.equal(model.id, "new-model");
 	assert.equal(model.name, "New Model");
-	assert.equal(model.cost.input, 2);
+	assert.deepEqual(model.cost, { input: 2, output: 2, cacheRead: 2, cacheWrite: 0 });
 	assert.equal(model.provider, PROVIDER_ID);
+	assert.equal((model.compat as Record<string, unknown>).supportsLongCacheRetention, true);
 	const nameless = unknownModelConfig("x", BASE);
 	assert.equal(nameless.name, "x");
 	assert.equal(nameless.cost.input, 0);
+});
+
+test("retention matrix: only routes verified to accept prompt_cache_retention", () => {
+	const retention = new Map(
+		CATALOG.map((m) => [m.id, (m.compat as Record<string, unknown>).supportsLongCacheRetention]),
+	);
+	// rejected with "json: unknown field" (probe 2026-09-15)
+	for (const id of ["deepseek-v4-flash", "doubao-seed-2.1-pro", "glm-5.2"]) {
+		assert.equal(retention.get(id), false, id);
+	}
+	// accepted with 200 (probe 2026-09-15)
+	for (const id of [
+		"deepseek-v4-pro",
+		"glm-5.3",
+		"glm-5.3-flash",
+		"qwen3.7-max",
+		"qwen3.7-plus",
+		"qwen3.8-flash",
+		"qwen3.8-max",
+		"kimi-k2.7-code",
+		"kimi-k3",
+		"MiniMax-M3",
+		"hy3",
+		"zhipu/glm-5.3",
+	]) {
+		assert.equal(retention.get(id), true, id);
+	}
 });
 
 // ---------------------------------------------------------------------------
@@ -515,6 +543,75 @@ test("provider.refreshModels: network run persists merged catalog", async () => 
 	const models = provider.getModels();
 	assert.ok(models.find((m) => m.id === "glm-9"), "new gateway model added");
 	assert.equal(models.find((m) => m.id === "deepseek-v4-flash")!.cost.input, 0.4, "credits refreshed");
+});
+
+// ---------------------------------------------------------------------------
+// prompt_cache_retention wiring (payload level, via real pi-ai builders)
+// ---------------------------------------------------------------------------
+
+type CapturedPayload = Record<string, any> | undefined;
+
+async function capturePayload(provider: AnyProvider, modelId: string, cacheRetention: "long" | "short" | "none") {
+	const model = provider.getModels().find((m: AnyProvider) => m.id === modelId)!;
+	const context = {
+		messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: new Date().toISOString() }],
+		systemPrompt: "",
+		tools: [],
+	};
+	let payload: CapturedPayload;
+	try {
+		await provider
+			.stream(model, context as never, {
+				apiKey: "test-key",
+				cacheRetention,
+				sessionId: "sess-retention-test",
+				onPayload: async (p: Record<string, any>) => {
+					payload = p;
+					throw new Error("capture-stop");
+				},
+			})
+			.result();
+	} catch {
+		// capture-stop terminates the stream; payload already recorded
+	}
+	return payload;
+}
+
+test("PI_CACHE_RETENTION=long sends prompt_cache_retention:24h only on verified routes", async () => {
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE });
+
+	// responses: accepted models get the field + cache key
+	for (const id of ["qwen3.8-flash", "glm-5.3", "deepseek-v4-pro"]) {
+		const payload = await capturePayload(provider, id, "long");
+		assert.equal(payload?.prompt_cache_retention, "24h", `${id}: retention sent`);
+		assert.equal(payload?.prompt_cache_key, "sess-retention-test", `${id}: cache key sent`);
+	}
+	// responses: strict models must never see the field (gateway 400s)
+	for (const id of ["deepseek-v4-flash", "doubao-seed-2.1-pro", "glm-5.2"]) {
+		const payload = await capturePayload(provider, id, "long");
+		assert.equal(payload?.prompt_cache_retention, undefined, `${id}: retention suppressed`);
+		assert.equal(payload?.prompt_cache_key, "sess-retention-test", `${id}: cache key still sent`);
+	}
+	// chat: all routes accepted retention
+	for (const id of ["kimi-k2.7-code", "MiniMax-M3", "zhipu/glm-5.3"]) {
+		const payload = await capturePayload(provider, id, "long");
+		assert.equal(payload?.prompt_cache_retention, "24h", `${id}: retention sent`);
+		assert.equal(payload?.prompt_cache_key, "sess-retention-test", `${id}: cache key sent`);
+	}
+});
+
+test("default (short) retention sends no retention field anywhere", async () => {
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE });
+	for (const id of ["qwen3.8-flash", "kimi-k2.7-code"]) {
+		const payload = await capturePayload(provider, id, "short");
+		assert.equal(payload?.prompt_cache_retention, undefined, `${id}: no retention in short mode`);
+	}
+	// responses still gets the affinity key in short mode; chat does not
+	// (pi-ai sends chat prompt_cache_key only for api.openai.com or long retention)
+	const responses = await capturePayload(provider, "qwen3.8-flash", "short");
+	assert.equal(responses?.prompt_cache_key, "sess-retention-test");
+	const chat = await capturePayload(provider, "kimi-k2.7-code", "short");
+	assert.equal(chat?.prompt_cache_key, undefined);
 });
 
 // ---------------------------------------------------------------------------

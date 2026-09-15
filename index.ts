@@ -45,6 +45,14 @@
  *     `stream_options.include_usage`, accept `strict:false` tools and
  *     `max_completion_tokens`; kimi tool-call round-trips verified.
  *
+ * Prompt caching: implicit prefix caching works gateway-wide (repeat of a
+ * ~2.8k-token prompt returns cached_tokens 2048–2816 on qwen3.8-flash,
+ * kimi-k2.7-code and glm-5.3-flash). `prompt_cache_retention:"24h"`
+ * (sent by pi only under PI_CACHE_RETENTION=long) is accepted by all chat
+ * routes and by deepseek-v4-pro/glm-5.3/glm-5.3-flash/qwen*, but rejected
+ * ("json: unknown field") by deepseek-v4-flash/doubao-seed-2.1-pro/glm-5.2 —
+ * those three keep supportsLongCacheRetention:false.
+ *
  * Key validation (zero inference): POST {} to /responses returns
  * 400 "AI request body should have string model field." for a VALID key and
  * 401 "Consumer authentication failed." for an invalid one.
@@ -57,7 +65,9 @@
  * Billing: the gateway reports a per-model `credit` multiplier via
  * GET /v1/models (changes over time — credit_history). 1 credit ≈ $1 per 1M
  * tokens (scale-matched against public Ark pricing); costs below use the
- * credits observed on 2026-09-15. When the network is allowed, pi refreshes
+ * credits observed on 2026-09-15. Cache reads are priced at the input rate
+ * (cached_tokens confirmed in usage; gateway billing split unknown — same
+ * convention as the reference volc extensions). When the network is allowed, pi refreshes
  * the catalog via fetchModels (GET /v1/models): fresh names/credits, new
  * gateway models auto-registered with conservative defaults, persisted to
  * pi's models store for offline starts. The dynamic overlay upserts over the
@@ -105,20 +115,30 @@ type CatalogEntry = Omit<Model<GatewayApi>, "provider" | "baseUrl">;
 // ---------------------------------------------------------------------------
 
 /** Verified on every /responses route: developer role OK, strict tools not needed.
- *  supportsLongCacheRetention:false keeps pi from sending the unverified
- *  `prompt_cache_retention` field. */
+ *  supportsLongCacheRetention:true — `prompt_cache_retention:"24h"` accepted (200)
+ *  on deepseek-v4-pro, glm-5.3, glm-5.3-flash and all four qwen routes
+ *  (probe 2026-09-15). pi only sends it under PI_CACHE_RETENTION=long. */
 const RESPONSES_COMPAT = {
 	supportsDeveloperRole: true,
-	supportsLongCacheRetention: false,
+	supportsLongCacheRetention: true,
 	supportsStrictMode: false,
 };
 
+/** deepseek-v4-flash / doubao-seed-2.1-pro / glm-5.2 reject unknown JSON
+ *  fields outright: `prompt_cache_retention` 400s with
+ *  "json: unknown field" (same strictness as their `reasoning.summary`
+ *  rejection) — retention must stay disabled for them. */
+const RESPONSES_STRICT_COMPAT = { ...RESPONSES_COMPAT, supportsLongCacheRetention: false };
+
 /** Verified on every /chat/completions route: system role, no `store`,
- *  usage-in-streaming via stream_options, max_completion_tokens accepted. */
+ *  usage-in-streaming via stream_options, max_completion_tokens accepted.
+ *  supportsLongCacheRetention:true — all 5 chat routes accepted
+ *  `prompt_cache_retention:"24h"` (200, probe 2026-09-15). */
 const CHAT_COMPAT = {
 	supportsDeveloperRole: false,
 	supportsStore: false,
 	supportsUsageInStreaming: true,
+	supportsLongCacheRetention: true,
 	maxTokensField: "max_completion_tokens" as const,
 };
 
@@ -213,9 +233,11 @@ export const STRIP_REASONING_SUMMARY = new Set(["deepseek-v4-flash", "doubao-see
 /** Gateway smart-routing pseudo-entry that must never be registered. */
 const SKIP_MODEL_IDS = new Set(["auto"]);
 
-/** Credits observed via GET /v1/models on 2026-09-15 (≈ $/1M tokens). */
+/** Credits observed via GET /v1/models on 2026-09-15 (≈ $/1M tokens).
+ *  cacheRead priced at the input rate: cached_tokens confirmed in usage on
+ *  qwen/kimi/glm repeats; the gateway does not expose a cache discount. */
 function credits(credit: number): Model<GatewayApi>["cost"] {
-	return { input: credit, output: credit, cacheRead: 0, cacheWrite: 0 };
+	return { input: credit, output: credit, cacheRead: credit, cacheWrite: 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +256,7 @@ export const CATALOG: CatalogEntry[] = [
 		cost: credits(0.33),
 		contextWindow: 1_000_000,
 		maxTokens: 393_216, // gateway cap: "max_output_tokens <= 393216"
-		compat: { ...RESPONSES_COMPAT },
+		compat: { ...RESPONSES_STRICT_COMPAT }, // rejects prompt_cache_retention
 	},
 	{
 		id: "deepseek-v4-pro",
@@ -258,7 +280,7 @@ export const CATALOG: CatalogEntry[] = [
 		cost: credits(1.85),
 		contextWindow: 256_000, // >256k input rejected ("exceed max message tokens")
 		maxTokens: 262_144, // gateway cap
-		compat: { ...RESPONSES_COMPAT },
+		compat: { ...RESPONSES_STRICT_COMPAT }, // rejects prompt_cache_retention
 	},
 	{
 		id: "glm-5.2",
@@ -270,7 +292,7 @@ export const CATALOG: CatalogEntry[] = [
 		cost: credits(1.46),
 		contextWindow: 1_000_000,
 		maxTokens: 131_072, // gateway cap
-		compat: { ...RESPONSES_COMPAT },
+		compat: { ...RESPONSES_STRICT_COMPAT }, // rejects prompt_cache_retention
 	},
 	{
 		id: "glm-5.3",
@@ -437,6 +459,8 @@ export function unknownModelConfig(id: string, baseUrl: string, name?: string, c
 		cost: credit !== undefined && credit > 0 ? credits(credit) : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 8_192,
+		// CHAT_COMPAT carries supportsLongCacheRetention:true — every chat
+		// route probed so far accepted prompt_cache_retention.
 		compat: { ...CHAT_COMPAT, supportsReasoningEffort: false },
 	};
 }
