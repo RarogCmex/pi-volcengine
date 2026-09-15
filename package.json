@@ -1,0 +1,49 @@
+{
+  "name": "pi-volcengine",
+  "version": "0.1.0",
+  "description": "Pi provider extension for Volcengine API Gateway (volceapi.com) subscriptions: Responses API first, chat-completions fallback, dynamic model refresh.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-provider",
+    "volcengine",
+    "volceapi",
+    "apigateway",
+    "responses-api",
+    "deepseek",
+    "glm",
+    "qwen",
+    "kimi",
+    "minimax",
+    "doubao"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "tsx --test test/provider.test.ts",
+    "check": "npm run typecheck && npm run test"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "24.6.2",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}
