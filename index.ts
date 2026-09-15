@@ -4,7 +4,9 @@
  * Endpoint: per-subscriber API Gateway URL, e.g.
  *           https://<id>.apigateway-cn-beijing.volceapi.com/v1
  *           (override with $VOLCEAPI_BASE_URL)
- * Auth:     API key via $VOLCEAPI_API_KEY or `pi /login volcengine-gateway`
+ * Auth:     `pi /login volcengine-gateway` (key is validated against the
+ *           gateway before it is saved, stored in ~/.pi/agent/auth.json)
+ *           or $VOLCEAPI_API_KEY.
  *
  * Priority API surface: OpenAI **Responses API** (`/responses`, stateless
  * store:false). Models whose upstream vendor does not speak Responses on this
@@ -43,6 +45,10 @@
  *     `stream_options.include_usage`, accept `strict:false` tools and
  *     `max_completion_tokens`; kimi tool-call round-trips verified.
  *
+ * Key validation (zero inference): POST {} to /responses returns
+ * 400 "AI request body should have string model field." for a VALID key and
+ * 401 "Consumer authentication failed." for an invalid one.
+ *
  * Context windows / max output tokens: from gateway 400-error caps where
  * available (kimi 262144/1048576, MiniMax 524288, zhipu 131072, hy3 input
  * 192000, deepseek-v4-flash 393216, doubao 262144, glm 131072, qwen3.7
@@ -51,25 +57,37 @@
  * Billing: the gateway reports a per-model `credit` multiplier via
  * GET /v1/models (changes over time — credit_history). 1 credit ≈ $1 per 1M
  * tokens (scale-matched against public Ark pricing); costs below use the
- * credits observed on 2026-09-15 and are refreshed by `pi update --models`
- * (refreshModels fetches /v1/models, persists to pi's models store, and
- * auto-registers newly added gateway models with conservative defaults).
+ * credits observed on 2026-09-15. When the network is allowed, pi refreshes
+ * the catalog via fetchModels (GET /v1/models): fresh names/credits, new
+ * gateway models auto-registered with conservative defaults, persisted to
+ * pi's models store for offline starts. The dynamic overlay upserts over the
+ * static baseline, so models removed from the gateway linger until this
+ * extension is updated.
  *
  * Usage:
- *   export VOLCEAPI_API_KEY=...
- *   pi                      # /model -> volcengine-gateway/<model>
- *   pi update --models      # refresh catalog/credits from the gateway
+ *   pi                        # /login volcengine-gateway, then /model
+ *   export VOLCEAPI_API_KEY=… # alternative to /login
  */
 
-import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import {
+	createProvider,
+	type ApiKeyCredential,
+	type AuthContext,
+	type Model,
+	type ProviderAuthInteraction,
+	type RefreshModelsContext,
+	type ThinkingLevelMap,
+} from "@earendil-works/pi-ai";
+import { openAICompletionsApi, openAIResponsesApi } from "@earendil-works/pi-ai/compat";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const PROVIDER_ID = "volcengine-gateway";
 export const DEFAULT_BASE_URL = "https://YOUR-GATEWAY-ID.apigateway-cn-beijing.volceapi.com/v1";
 export const API_KEY_ENV = "VOLCEAPI_API_KEY";
 export const BASE_URL_ENV = "VOLCEAPI_BASE_URL";
 
-/** How long a persisted gateway catalog stays fresh before a network refresh. */
-const REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+/** Timeout for the zero-inference key-validation probe. */
+const KEY_VALIDATION_TIMEOUT_MS = 12_000;
 /** Timeout for the GET /models catalog fetch. */
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -79,9 +97,11 @@ export function resolveBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
 	return DEFAULT_BASE_URL;
 }
 
+type GatewayApi = "openai-responses" | "openai-completions";
+type CatalogEntry = Omit<Model<GatewayApi>, "provider" | "baseUrl">;
+
 // ---------------------------------------------------------------------------
-// compat blocks (pi's extension form does NOT merge provider-level compat —
-// every field lives per model, so shared sets are spread into each entry)
+// compat blocks
 // ---------------------------------------------------------------------------
 
 /** Verified on every /responses route: developer role OK, strict tools not needed.
@@ -91,7 +111,7 @@ const RESPONSES_COMPAT = {
 	supportsDeveloperRole: true,
 	supportsLongCacheRetention: false,
 	supportsStrictMode: false,
-} satisfies Partial<ProviderModelConfig["compat"]>;
+};
 
 /** Verified on every /chat/completions route: system role, no `store`,
  *  usage-in-streaming via stream_options, max_completion_tokens accepted. */
@@ -100,7 +120,7 @@ const CHAT_COMPAT = {
 	supportsStore: false,
 	supportsUsageInStreaming: true,
 	maxTokensField: "max_completion_tokens" as const,
-} satisfies Partial<ProviderModelConfig["compat"]>;
+};
 
 // ---------------------------------------------------------------------------
 // thinking level maps (pi level -> provider value; null = level unavailable)
@@ -115,7 +135,7 @@ const DEEPSEEK_EFFORT = {
 	high: "high",
 	xhigh: "high",
 	max: "high",
-} as const;
+} satisfies ThinkingLevelMap;
 
 /** doubao-seed-2.1-pro: none/minimal/low/medium/high verified; none ⇒ rt=0. */
 const DOUBAO_EFFORT = {
@@ -126,7 +146,7 @@ const DOUBAO_EFFORT = {
 	high: "high",
 	xhigh: "high",
 	max: "high",
-} as const;
+} satisfies ThinkingLevelMap;
 
 /** glm-5.2: every value verified incl. max; none/minimal ⇒ rt=0. */
 const GLM52_EFFORT = {
@@ -137,7 +157,7 @@ const GLM52_EFFORT = {
 	high: "high",
 	xhigh: "max",
 	max: "max",
-} as const;
+} satisfies ThinkingLevelMap;
 
 /** glm-5.3 / glm-5.3-flash: "always thinks" — gateway rejects off/minimal/
  *  medium; only low/high/max (low ⇒ ~zero reasoning tokens). */
@@ -149,7 +169,7 @@ const GLM53_EFFORT = {
 	high: "high",
 	xhigh: "max",
 	max: "max",
-} as const;
+} satisfies ThinkingLevelMap;
 
 /** qwen3.7/3.8: none/minimal/low/medium/high/max verified (none ⇒ rt=0). */
 const QWEN_EFFORT = {
@@ -160,7 +180,7 @@ const QWEN_EFFORT = {
 	high: "high",
 	xhigh: "max",
 	max: "max",
-} as const;
+} satisfies ThinkingLevelMap;
 
 /** kimi-*: thinking cannot be disabled or steered on this gateway; expose a
  *  single nominal "high" so the level picker has an entry, send nothing. */
@@ -172,7 +192,7 @@ const KIMI_UNCONTROLLABLE = {
 	high: "high",
 	xhigh: null,
 	max: null,
-} as const;
+} satisfies ThinkingLevelMap;
 
 /** zhipu/glm-5.3 (chat route): reasoning_effort accepts only low/high/max
  *  (low ⇒ ~zero reasoning); minimal/medium/off rejected — always thinks. */
@@ -184,7 +204,7 @@ const ZHIPU_EFFORT = {
 	high: "high",
 	xhigh: "max",
 	max: "max",
-} as const;
+} satisfies ThinkingLevelMap;
 
 /** Models whose upstream rejects `reasoning.summary` on /responses — the
  *  before_provider_request hook strips it from their payloads. */
@@ -194,7 +214,7 @@ export const STRIP_REASONING_SUMMARY = new Set(["deepseek-v4-flash", "doubao-see
 const SKIP_MODEL_IDS = new Set(["auto"]);
 
 /** Credits observed via GET /v1/models on 2026-09-15 (≈ $/1M tokens). */
-function credits(credit: number): ProviderModelConfig["cost"] {
+function credits(credit: number): Model<GatewayApi>["cost"] {
 	return { input: credit, output: credit, cacheRead: 0, cacheWrite: 0 };
 }
 
@@ -202,11 +222,12 @@ function credits(credit: number): ProviderModelConfig["cost"] {
 // static catalog (verified against the live gateway on 2026-09-15)
 // ---------------------------------------------------------------------------
 
-export const CATALOG: ProviderModelConfig[] = [
-	// ---- Responses API (provider default api) ----
+export const CATALOG: CatalogEntry[] = [
+	// ---- Responses API ----
 	{
 		id: "deepseek-v4-flash",
 		name: "DeepSeek V4 Flash",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...DEEPSEEK_EFFORT },
 		input: ["text"],
@@ -218,6 +239,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "deepseek-v4-pro",
 		name: "DeepSeek V4 Pro",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...DEEPSEEK_EFFORT },
 		input: ["text"],
@@ -229,6 +251,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "doubao-seed-2.1-pro",
 		name: "Doubao Seed 2.1 Pro",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...DOUBAO_EFFORT },
 		input: ["text", "image"], // vision verified
@@ -240,6 +263,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "glm-5.2",
 		name: "GLM 5.2",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...GLM52_EFFORT },
 		input: ["text"], // image input yields empty output on this route
@@ -251,6 +275,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "glm-5.3",
 		name: "GLM 5.3",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...GLM53_EFFORT },
 		input: ["text"], // image input is ignored by the model on this route
@@ -262,6 +287,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "glm-5.3-flash",
 		name: "GLM 5.3 Flash",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...GLM53_EFFORT },
 		input: ["text", "image"], // vision verified
@@ -273,6 +299,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "qwen3.7-max",
 		name: "Qwen3.7-Max",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...QWEN_EFFORT },
 		input: ["text"], // gateway: "only supports text modality"
@@ -284,6 +311,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "qwen3.7-plus",
 		name: "Qwen3.7-Plus",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...QWEN_EFFORT },
 		input: ["text", "image"], // vision verified
@@ -295,6 +323,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "qwen3.8-flash",
 		name: "Qwen3.8-Flash",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...QWEN_EFFORT },
 		input: ["text", "image"], // vision verified
@@ -306,6 +335,7 @@ export const CATALOG: ProviderModelConfig[] = [
 	{
 		id: "qwen3.8-max",
 		name: "Qwen3.8-Max",
+		api: "openai-responses",
 		reasoning: true,
 		thinkingLevelMap: { ...QWEN_EFFORT },
 		input: ["text", "image"], // vision verified
@@ -378,6 +408,10 @@ export const CATALOG: ProviderModelConfig[] = [
 	},
 ];
 
+export function buildModels(baseUrl: string): Model<GatewayApi>[] {
+	return CATALOG.map((entry) => ({ ...entry, provider: PROVIDER_ID, baseUrl }));
+}
+
 // ---------------------------------------------------------------------------
 // dynamic catalog (GET /v1/models) merged over the static capability table
 // ---------------------------------------------------------------------------
@@ -389,11 +423,13 @@ export interface GatewayModelEntry {
 }
 
 /** Conservative registration for gateway models this build has never seen. */
-export function unknownModelConfig(id: string, name?: string, credit?: number): ProviderModelConfig {
+export function unknownModelConfig(id: string, baseUrl: string, name?: string, credit?: number): Model<GatewayApi> {
 	return {
 		id,
 		name: name?.trim() || id,
 		api: "openai-completions", // chat completions works for every gateway model
+		provider: PROVIDER_ID,
+		baseUrl,
 		reasoning: true,
 		// every level null => pi sends no thinking parameters at all
 		thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: null },
@@ -412,9 +448,9 @@ export function unknownModelConfig(id: string, name?: string, credit?: number): 
  * - listed-but-unknown junk ("auto") is skipped
  * - an empty/invalid listing falls back to the static catalog
  */
-export function mergeGatewayCatalog(raw: GatewayModelEntry[]): ProviderModelConfig[] {
+export function mergeGatewayCatalog(raw: GatewayModelEntry[], baseUrl: string): Model<GatewayApi>[] {
 	const known = new Map(CATALOG.map((entry) => [entry.id, entry]));
-	const merged: ProviderModelConfig[] = [];
+	const merged: Model<GatewayApi>[] = [];
 	const seen = new Set<string>();
 	for (const entry of raw) {
 		const id = typeof entry?.id === "string" ? entry.id.trim() : "";
@@ -428,77 +464,175 @@ export function mergeGatewayCatalog(raw: GatewayModelEntry[]): ProviderModelConf
 				...base,
 				name: name ?? base.name,
 				cost: credit !== undefined && credit > 0 ? credits(credit) : base.cost,
+				provider: PROVIDER_ID,
+				baseUrl,
 			});
 		} else {
-			merged.push(unknownModelConfig(id, name, credit));
+			merged.push(unknownModelConfig(id, baseUrl, name, credit));
 		}
 	}
-	if (merged.length === 0) return CATALOG.map((entry) => ({ ...entry }));
+	if (merged.length === 0) return buildModels(baseUrl);
 	return merged;
 }
 
-/** Structural mirror of pi-ai's RefreshModelsContext (avoids a hard pi-ai dep). */
-export interface GatewayRefreshContext {
-	credential?: { type?: string; key?: string } | undefined;
-	stored?: { models?: unknown[]; checkedAt?: number } | undefined;
-	publish(publication: { persist?: unknown; update?: () => void }): Promise<boolean>;
-	allowNetwork: boolean;
-	force?: boolean | undefined;
-	signal: AbortSignal;
+/**
+ * fetchModels for createProvider: pi restores/persists the returned overlay
+ * transactionally (models store), so offline starts reuse the last fetched
+ * catalog. Any failure degrades to the static baseline.
+ */
+export async function fetchGatewayModels(
+	context: RefreshModelsContext,
+	baseUrl: string,
+	fetchImpl: typeof fetch = fetch,
+): Promise<Model<GatewayApi>[]> {
+	const fallback = buildModels(baseUrl);
+	const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
+	if (!key) return fallback;
+	try {
+		const response = await fetchImpl(`${baseUrl}/models`, {
+			headers: { Authorization: `Bearer ${key}` },
+			signal: AbortSignal.any([context.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]),
+		});
+		if (!response.ok) return fallback;
+		const data = (await response.json()) as { data?: GatewayModelEntry[] };
+		if (!Array.isArray(data?.data) || data.data.length === 0) return fallback;
+		return mergeGatewayCatalog(data.data, baseUrl);
+	} catch {
+		return fallback;
+	}
 }
 
-function staticCatalog(): ProviderModelConfig[] {
-	return CATALOG.map((entry) => ({ ...entry }));
+// ---------------------------------------------------------------------------
+// key validation + login flow
+// ---------------------------------------------------------------------------
+
+export interface KeyValidationResult {
+	status: "valid" | "invalid" | "unavailable";
+	reason?: string;
 }
 
-function storedCatalog(ctx: GatewayRefreshContext): ProviderModelConfig[] {
-	const models = ctx.stored?.models;
-	if (!Array.isArray(models) || models.length === 0) return staticCatalog();
-	const filtered = models.filter((m) => {
-		const provider = (m as { provider?: unknown })?.provider;
-		return provider === undefined || provider === PROVIDER_ID;
-	}) as ProviderModelConfig[];
-	return filtered.length > 0 ? filtered : staticCatalog();
+export interface ValidateKeyOptions {
+	baseUrl?: string;
+	fetchImpl?: typeof fetch;
+	signal?: AbortSignal;
 }
 
 /**
- * pi-native dynamic refresh: offline runs restore the persisted catalog;
- * network runs (pi update --models, background refresh) re-fetch
- * GET /v1/models at most every REFRESH_INTERVAL_MS unless forced.
+ * Zero-inference key check: POST {} to /responses.
+ * 400 ("should have string model field") ⇒ the key authenticated;
+ * 401/403 ⇒ rejected; anything else ⇒ gateway state unknown.
+ * Never logs or returns the key.
  */
-export async function refreshGatewayModels(
-	ctx: GatewayRefreshContext,
-	env: NodeJS.ProcessEnv = process.env,
-	fetchImpl: typeof fetch = fetch,
-): Promise<ProviderModelConfig[]> {
-	const cached = storedCatalog(ctx);
-	if (!ctx.allowNetwork) return cached;
-
-	const key = ctx.credential?.type === "api_key" ? ctx.credential.key : undefined;
-	if (!key) return cached;
-
-	const checkedAt = ctx.stored?.checkedAt;
-	if (!ctx.force && checkedAt !== undefined && Date.now() - checkedAt < REFRESH_INTERVAL_MS) {
-		return cached;
-	}
-
+export async function validateGatewayKey(key: string, options: ValidateKeyOptions = {}): Promise<KeyValidationResult> {
+	const baseUrl = options.baseUrl ?? resolveBaseUrl();
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), KEY_VALIDATION_TIMEOUT_MS);
+	const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
 	try {
-		const baseUrl = resolveBaseUrl(env);
-		const response = await fetchImpl(`${baseUrl}/models`, {
-			headers: { Authorization: `Bearer ${key}` },
-			signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]),
+		const response = await (options.fetchImpl ?? fetch)(`${baseUrl}/responses`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+			body: "{}",
+			signal,
 		});
-		if (!response.ok) return cached;
-		const data = (await response.json()) as { data?: GatewayModelEntry[] };
-		if (!Array.isArray(data?.data) || data.data.length === 0) return cached;
-		const merged = mergeGatewayCatalog(data.data);
-		const persisted = merged.map((model) => ({ ...model, provider: PROVIDER_ID, baseUrl }));
-		await ctx.publish({ persist: { models: persisted, checkedAt: Date.now() } });
-		if (ctx.signal.aborted) return cached;
-		return merged;
-	} catch {
-		return cached;
+		if (response.status === 401 || response.status === 403) return { status: "invalid" };
+		if (response.ok || response.status === 400) return { status: "valid" };
+		return { status: "unavailable", reason: `HTTP ${response.status}` };
+	} catch (error) {
+		return { status: "unavailable", reason: error instanceof Error ? error.message : String(error) };
+	} finally {
+		clearTimeout(timeout);
 	}
+}
+
+async function promptValidatedGatewayKey(
+	interaction: ProviderAuthInteraction,
+	options: ValidateKeyOptions,
+): Promise<string> {
+	keyPrompt: while (true) {
+		const key = (await interaction.prompt({
+			type: "secret",
+			message: "Volcengine Gateway API key (volceapi.com consumer key, UUID format)",
+		})).trim();
+		if (!key) continue keyPrompt;
+		while (true) {
+			interaction.notify({ type: "progress", message: "Validating key against the gateway…" });
+			const result = await validateGatewayKey(key, { ...options, signal: interaction.signal });
+			if (result.status === "valid") {
+				interaction.notify({ type: "info", message: "API key validated." });
+				return key;
+			}
+			if (result.status === "invalid") {
+				interaction.notify({ type: "info", message: "The gateway rejected this key (401). Please re-enter it." });
+				continue keyPrompt;
+			}
+			const choice = await interaction.prompt({
+				type: "select",
+				message: `Gateway unreachable (${result.reason ?? "network error"}). What would you like to do?`,
+				options: [
+					{ id: "retry", label: "Retry validation" },
+					{ id: "save", label: "Save without validating" },
+				],
+			});
+			if (choice === "save") return key;
+			// retry: validate the same key again
+		}
+	}
+}
+
+async function resolveKey(ctx: AuthContext, credential?: ApiKeyCredential) {
+	const stored = credential?.key?.trim();
+	if (stored) return { key: stored, source: "stored credential (Pi auth.json)" };
+	const fromEnv = (await ctx.env(API_KEY_ENV))?.trim();
+	if (fromEnv) return { key: fromEnv, source: `$${API_KEY_ENV}` };
+	return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// provider factory
+// ---------------------------------------------------------------------------
+
+export interface VolcengineGatewayOptions {
+	baseUrl?: string;
+	fetchImpl?: typeof fetch;
+}
+
+export function createVolcengineGatewayProvider(options: VolcengineGatewayOptions = {}) {
+	const baseUrl = options.baseUrl ?? resolveBaseUrl();
+	const fetchImpl = options.fetchImpl ?? fetch;
+	return createProvider<GatewayApi>({
+		id: PROVIDER_ID,
+		name: "Volcengine API Gateway",
+		baseUrl,
+		auth: {
+			apiKey: {
+				name: "Volcengine Gateway API key",
+				async login(interaction) {
+					interaction.notify({
+						type: "info",
+						message: `Gateway endpoint: ${baseUrl} — use the consumer API key issued with your volceapi.com subscription (a plain Ark key will not work).`,
+					});
+					const key = await promptValidatedGatewayKey(interaction, { baseUrl, fetchImpl });
+					return { type: "api_key", key };
+				},
+				async check({ ctx, credential }) {
+					const resolved = await resolveKey(ctx, credential);
+					return resolved ? { type: "api_key", source: resolved.source } : undefined;
+				},
+				async resolve({ ctx, credential }) {
+					const resolved = await resolveKey(ctx, credential);
+					if (!resolved) return undefined;
+					return { auth: { apiKey: resolved.key }, source: resolved.source };
+				},
+			},
+		},
+		models: buildModels(baseUrl),
+		fetchModels: (context) => fetchGatewayModels(context, baseUrl, fetchImpl),
+		api: {
+			"openai-responses": openAIResponsesApi(),
+			"openai-completions": openAICompletionsApi(),
+		},
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -564,14 +698,7 @@ export function normalizeOverflowError(errorMessage: string): string | null {
 // ---------------------------------------------------------------------------
 
 export default function volcengineGateway(pi: ExtensionAPI): void {
-	pi.registerProvider(PROVIDER_ID, {
-		name: "Volcengine API Gateway",
-		baseUrl: resolveBaseUrl(),
-		apiKey: `$${API_KEY_ENV}`,
-		api: "openai-responses",
-		models: staticCatalog(),
-		refreshModels: (ctx) => refreshGatewayModels(ctx as unknown as GatewayRefreshContext),
-	});
+	pi.registerProvider(createVolcengineGatewayProvider());
 
 	pi.on("before_provider_request", (event) => {
 		const rewritten = rewriteProviderPayload(event.payload);

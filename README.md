@@ -17,12 +17,21 @@ pi install git:<repo>@main               # из git
 
 ## Авторизация
 
-```bash
-export VOLCEAPI_API_KEY="<ваш-consumer-key-UUID>"     # ключ потребителя шлюза (api-key-…)
-pi
+**Вариант 1 — интерактивный (рекомендуется):**
+
+```
+/login volcengine-gateway
 ```
 
-Либо через `pi` → `/login volcengine-gateway` (ключ сохранится в `~/.pi/agent/auth.json` и имеет приоритет над env).
+Расширение попросит consumer-ключ шлюза (UUID) и **проверит его до сохранения** zero-inference зондом (`POST {} → /responses`: 400 = ключ прошёл аутентификацию, 401 = отклонён). Неверный ключ → повторный ввод; шлюз недоступен → выбор «retry / сохранить без проверки». Ключ ляжет в `~/.pi/agent/auth.json`.
+
+**Вариант 2 — переменная окружения:**
+
+```bash
+export VOLCEAPI_API_KEY="<ваш-consumer-key-UUID>"
+```
+
+Сохранённый через `/login` ключ имеет приоритет над env. Порядок разрешения: stored credential → `$VOLCEAPI_API_KEY`.
 
 Base URL по умолчанию зашит в расширение; переопределяется через:
 
@@ -30,7 +39,7 @@ Base URL по умолчанию зашит в расширение; перео�
 export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com/v1"
 ```
 
-Выбор модели: `/model` → `volcengine-gateway/<id>` (например `volcengine-gateway/qwen3.8-flash`).
+Выбор модели: `/model` → `volcengine-gateway/<id>`; список: `pi --list-models volcengine` (показывается только при разрешённой авторизации).
 
 ## Модели
 
@@ -71,7 +80,7 @@ export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com
    - `deepseek-v4-flash`, `doubao-seed-2.1-pro`, `glm-5.2` отвергают поле `reasoning.summary` (`json: unknown field "summary"`), а pi-ai всегда отправляет его вместе с `reasoning.effort`. Хук вырезает `summary` ровно для этих моделей (effort и `include` сохраняются). `deepseek-v4-pro`, `glm-5.3*`, `qwen*` принимают `summary` — их не трогаем.
    - `MiniMax-M3` принимает только `thinking:{type:"adaptive"|"disabled"}` — хук переписывает pi-ai-овское `{type:"enabled"}` (deepseek-формат) в `{type:"adaptive"}`.
 2. **`message_end`** (нормализация переполнения контекста): ошибки шлюза (`Total tokens of image and text exceed…`, `Input tokens exceed the configured limit…`, `Range of input length…`, `OutofContextError`, CJK-варианты) переписываются в `context_length_exceeded: …`, чтобы pi запускал авто-компакцию и ретрай. Rate-limit ошибки намеренно НЕ трогаются.
-3. **Динамический каталог** (`refreshModels`): `pi update --models` (и фоновый refresh в интерактивном режиме) тянет `GET /v1/models`, обновляет имена/кредиты, регистрирует новые модели шлюза консервативными дефолтами (chat, text-only, 128K/8K, без thinking-параметров) и сохраняет результат в models-store pi — следующий старт офлайн использует кэш. Проверенные лимиты/карты из статического каталога не перезаписываются.
+3. **Динамический каталог** (`fetchModels` в нативной `createProvider`-форме): когда pi разрешает сеть (интерактивный старт, `pi update --models`), расширение тянет `GET /v1/models`, обновляет имена/кредиты, регистрирует новые модели шлюза консервативными дефолтами (chat, text-only, 128K/8K, без thinking-параметров) и сохраняет оверлей в models-store pi — офлайн-старты берут последний успешный снимок. Любая ошибка сети деградирует до статического каталога. Ограничение: оверлей **апсертится** поверх статики, поэтому модели, удалённые со шлюза, остаются в списке до обновления расширения.
 
 ## Проверенные возможности шлюза
 
@@ -83,7 +92,8 @@ export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com
 
 ```bash
 npm install
-npm run check        # tsc --noEmit + tsx --test (27 офлайн-тестов)
+npm run check        # tsc --noEmit + tsx --test (33 офлайн-теста: каталог, хуки,
+                     # merge/fetch, валидация ключа, login-флоу, check/resolve)
 ```
 
 Быстрый E2E (тратит кредиты подписки):
@@ -97,6 +107,10 @@ pi -ne -e ./index.ts -p --no-session --model volcengine-gateway/kimi-k2.7-code:h
 ```
 
 Обновить каталог/цены: `pi update --models`.
+
+## Архитектура
+
+Расширение зарегистрировано нативным `createProvider` (pi-ai): объект-провайдер с `auth.apiKey` (login/check/resolve), `fetchModels` (динамический оверлей + models-store) и api-картой `{"openai-responses", "openai-completions"}` — диспетчеризация по `model.api`. Хуки `before_provider_request` и `message_end` регистрируются отдельно и от формы провайдера не зависят.
 
 ## Известные ограничения
 

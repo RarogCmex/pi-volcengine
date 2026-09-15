@@ -10,35 +10,41 @@ import extension, {
 	DEFAULT_BASE_URL,
 	PROVIDER_ID,
 	STRIP_REASONING_SUMMARY,
+	buildModels,
+	createVolcengineGatewayProvider,
+	fetchGatewayModels,
 	mergeGatewayCatalog,
 	normalizeOverflowError,
-	refreshGatewayModels,
 	resolveBaseUrl,
 	rewriteProviderPayload,
 	unknownModelConfig,
-	type GatewayRefreshContext,
+	validateGatewayKey,
+	type GatewayModelEntry,
 } from "../index.ts";
 
 // ---------------------------------------------------------------------------
 // fake pi harness
 // ---------------------------------------------------------------------------
 
+type AnyProvider = Record<string, any>;
+
 interface FakePi {
 	pi: {
-		registerProvider: (name: unknown, config?: unknown) => void;
+		registerProvider: (nameOrProvider: unknown, config?: unknown) => void;
 		on: (event: string, handler: (...args: never[]) => unknown) => void;
 	};
-	providers: Map<string, Record<string, unknown>>;
+	providers: Map<string, AnyProvider>;
 	handlers: Map<string, ((...args: unknown[]) => unknown)[]>;
 }
 
 function createFakePi(): FakePi {
-	const providers = new Map<string, Record<string, unknown>>();
+	const providers = new Map<string, AnyProvider>();
 	const handlers = new Map<string, ((...args: unknown[]) => unknown)[]>();
 	return {
 		pi: {
-			registerProvider(name: unknown, config?: unknown) {
-				providers.set(String(name), config as Record<string, unknown>);
+			registerProvider(nameOrProvider: unknown, config?: unknown) {
+				if (typeof nameOrProvider === "string") providers.set(nameOrProvider, config as AnyProvider);
+				else providers.set((nameOrProvider as AnyProvider).id, nameOrProvider as AnyProvider);
 			},
 			on(event: string, handler: (...args: never[]) => unknown) {
 				const list = handlers.get(event) ?? [];
@@ -53,27 +59,91 @@ function createFakePi(): FakePi {
 
 function loadExtension(): FakePi {
 	const fake = createFakePi();
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	(extension as any)(fake.pi);
 	return fake;
 }
 
 // ---------------------------------------------------------------------------
-// registration shape
+// fetch / interaction stubs
 // ---------------------------------------------------------------------------
 
-test("registers one provider with responses-first config", () => {
+type StubResponse = { ok?: boolean; status: number; body?: unknown } | Error;
+
+function fetchStub(responses: StubResponse[] | StubResponse) {
+	const queue = Array.isArray(responses) ? [...responses] : undefined;
+	const single = Array.isArray(responses) ? undefined : responses;
+	const calls: { url: string; init?: RequestInit }[] = [];
+	const impl = (async (url: string, init?: RequestInit) => {
+		calls.push({ url, init });
+		const next = queue ? queue.shift() : single;
+		if (next instanceof Error) throw next;
+		if (!next) throw new Error("fetch stub exhausted");
+		return {
+			ok: next.ok ?? (next.status >= 200 && next.status < 300),
+			status: next.status,
+			json: async () => next.body,
+		} as unknown as Response;
+	}) as typeof fetch;
+	return { impl, calls };
+}
+
+function fakeAuthContext(env: Record<string, string> = {}) {
+	return {
+		env: async (name: string) => env[name],
+		fileExists: async () => false,
+	};
+}
+
+function fakeInteraction(promptResults: (string | Error)[]) {
+	const prompts: { type: string; message: string }[] = [];
+	const notices: { type: string; message: string }[] = [];
+	const queue = [...promptResults];
+	return {
+		prompts,
+		notices,
+		interaction: {
+			signal: new AbortController().signal,
+			async prompt(prompt: { type: string; message: string }) {
+				prompts.push(prompt);
+				const next = queue.shift();
+				if (next instanceof Error) throw next;
+				if (next === undefined) throw new Error("prompt queue exhausted");
+				return next;
+			},
+			notify(event: { type: string; message: string }) {
+				notices.push(event);
+			},
+		},
+	};
+}
+
+const BASE = "https://gw.test/v1";
+
+// ---------------------------------------------------------------------------
+// registration shape (provider object form)
+// ---------------------------------------------------------------------------
+
+test("registers one native provider with both API surfaces", () => {
 	const fake = loadExtension();
 	assert.equal(fake.providers.size, 1);
-	const config = fake.providers.get(PROVIDER_ID);
-	assert.ok(config, "provider registered under volcengine-gateway");
-	assert.equal(config.name, "Volcengine API Gateway");
-	assert.equal(config.baseUrl, DEFAULT_BASE_URL);
-	assert.equal(config.apiKey, "$VOLCEAPI_API_KEY");
-	assert.equal(config.api, "openai-responses");
-	assert.ok(Array.isArray(config.models));
-	assert.equal((config.models as unknown[]).length, CATALOG.length);
-	assert.equal(typeof config.refreshModels, "function");
+	const provider = fake.providers.get(PROVIDER_ID)!;
+	assert.ok(provider, "provider registered under volcengine-gateway");
+	assert.equal(provider.name, "Volcengine API Gateway");
+	assert.equal(provider.baseUrl, DEFAULT_BASE_URL);
+	assert.equal(typeof provider.auth?.apiKey?.login, "function");
+	assert.equal(typeof provider.auth?.apiKey?.check, "function");
+	assert.equal(typeof provider.auth?.apiKey?.resolve, "function");
+	assert.equal(typeof provider.refreshModels, "function");
+	assert.equal(typeof provider.stream, "function");
+	assert.equal(typeof provider.streamSimple, "function");
+
+	const models = provider.getModels();
+	assert.equal(models.length, CATALOG.length);
+	for (const model of models) {
+		assert.equal(model.provider, PROVIDER_ID);
+		assert.equal(model.baseUrl, DEFAULT_BASE_URL);
+		assert.ok(model.api === "openai-responses" || model.api === "openai-completions");
+	}
 });
 
 test("registers payload + message_end hooks", () => {
@@ -84,10 +154,13 @@ test("registers payload + message_end hooks", () => {
 
 test("resolveBaseUrl honors env override and strips trailing slashes", () => {
 	assert.equal(resolveBaseUrl({} as NodeJS.ProcessEnv), DEFAULT_BASE_URL);
-	assert.equal(
-		resolveBaseUrl({ VOLCEAPI_BASE_URL: "https://example.com/v1//" } as NodeJS.ProcessEnv),
-		"https://example.com/v1",
-	);
+	assert.equal(resolveBaseUrl({ VOLCEAPI_BASE_URL: "https://example.com/v1//" } as NodeJS.ProcessEnv), "https://example.com/v1");
+});
+
+test("createVolcengineGatewayProvider honors baseUrl option", () => {
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE });
+	assert.equal(provider.baseUrl, BASE);
+	assert.ok(provider.getModels().every((m) => m.baseUrl === BASE && m.provider === PROVIDER_ID));
 });
 
 // ---------------------------------------------------------------------------
@@ -122,11 +195,7 @@ test("catalog covers the full gateway listing with unique ids", () => {
 test("api split: 10 responses models, 5 chat-completions models", () => {
 	const chat = CATALOG.filter((m) => m.api === "openai-completions").map((m) => m.id);
 	assert.deepEqual(chat.sort(), ["MiniMax-M3", "hy3", "kimi-k2.7-code", "kimi-k3", "zhipu/glm-5.3"].sort());
-	for (const model of CATALOG) {
-		if (!chat.includes(model.id)) {
-			assert.equal(model.api, undefined, `${model.id} inherits provider api openai-responses`);
-		}
-	}
+	assert.equal(CATALOG.filter((m) => m.api === "openai-responses").length, 10);
 });
 
 test("every model has sane numeric metadata", () => {
@@ -164,7 +233,6 @@ test("thinking maps encode the verified gateway quirks", () => {
 	const byId = new Map(CATALOG.map((m) => [m.id, m]));
 	const map = (id: string) => byId.get(id)!.thinkingLevelMap as Record<string, string | null>;
 
-	// glm-5.3 family + zhipu: always-think models expose only low/high/max
 	for (const id of ["glm-5.3", "glm-5.3-flash", "zhipu/glm-5.3"]) {
 		assert.equal(map(id).off, null, `${id}: thinking cannot be disabled`);
 		assert.equal(map(id).medium, null, `${id}: medium rejected by gateway`);
@@ -172,23 +240,19 @@ test("thinking maps encode the verified gateway quirks", () => {
 		assert.equal(map(id).high, "high");
 		assert.equal(map(id).max, "max");
 	}
-	// full-control responses families can reach "none"
 	for (const id of ["deepseek-v4-flash", "deepseek-v4-pro", "doubao-seed-2.1-pro", "glm-5.2", "qwen3.8-flash"]) {
 		assert.equal(map(id).off, "none", `${id}: off maps to effort none`);
 	}
-	// kimi: only a nominal high, nothing steerable
 	const kimi = map("kimi-k2.7-code");
 	assert.equal(kimi.off, null);
 	assert.equal(kimi.high, "high");
 	assert.equal(kimi.low, null);
 
-	// summary-stripping set matches the models that 400 on reasoning.summary
 	assert.deepEqual(
 		[...STRIP_REASONING_SUMMARY].sort(),
 		["deepseek-v4-flash", "doubao-seed-2.1-pro", "glm-5.2"].sort(),
 	);
 
-	// chat models needing format help
 	const minimax = byId.get("MiniMax-M3")!.compat as Record<string, unknown>;
 	assert.equal(minimax.thinkingFormat, "deepseek");
 	assert.equal(minimax.supportsReasoningEffort, false);
@@ -224,12 +288,7 @@ test("strips reasoning.summary for rejecting responses models", () => {
 
 test("leaves summary-accepting responses models alone", () => {
 	for (const model of ["deepseek-v4-pro", "glm-5.3", "qwen3.8-max"]) {
-		const payload = {
-			model,
-			input: [],
-			store: false,
-			reasoning: { effort: "high", summary: "auto" },
-		};
+		const payload = { model, input: [], store: false, reasoning: { effort: "high", summary: "auto" } };
 		assert.equal(rewriteProviderPayload(payload), undefined, model);
 	}
 });
@@ -248,7 +307,6 @@ test("ignores foreign and malformed payloads", () => {
 	assert.equal(rewriteProviderPayload(undefined), undefined);
 	assert.equal(rewriteProviderPayload("nope"), undefined);
 	assert.equal(rewriteProviderPayload({ messages: [] }), undefined);
-	// openai's own responses payload with an unrelated model id
 	assert.equal(
 		rewriteProviderPayload({ model: "gpt-5.5", input: [], store: false, reasoning: { effort: "high", summary: "auto" } }),
 		undefined,
@@ -308,9 +366,7 @@ test("message_end hook rewrites only this provider's overflow errors", () => {
 	assert.ok(rewritten?.message.errorMessage.startsWith("context_length_exceeded: "));
 	assert.deepEqual(rewritten!.message.usage, {}, "other fields preserved");
 
-	// idempotent
 	assert.equal(hook({ message: { ...base, errorMessage: rewritten!.message.errorMessage } }, {}), undefined);
-	// foreign provider untouched
 	assert.equal(
 		hook(
 			{ message: { ...base, provider: "openai", errorMessage: "Range of input length should be [1, 5]" } },
@@ -318,14 +374,12 @@ test("message_end hook rewrites only this provider's overflow errors", () => {
 		),
 		undefined,
 	);
-	// ctx.model fallback detection
 	assert.ok(
 		hook(
 			{ message: { role: "assistant", stopReason: "error", content: [], errorMessage: "OutofContextError" } },
 			{ model: { provider: PROVIDER_ID } },
 		),
 	);
-	// non-error / non-assistant ignored
 	assert.equal(hook({ message: { ...base, stopReason: "stop", errorMessage: "OutofContextError" } }, {}), undefined);
 	assert.equal(hook({ message: { role: "user", content: [] } }, {}), undefined);
 });
@@ -334,7 +388,7 @@ test("message_end hook rewrites only this provider's overflow errors", () => {
 // dynamic catalog merge
 // ---------------------------------------------------------------------------
 
-const RAW_LISTING = [
+const RAW_LISTING: GatewayModelEntry[] = [
 	{ id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", credit: 0.4 },
 	{ id: "qwen3.8-flash", name: "Qwen3.8-Flash", credit: 0.21 },
 	{ id: "glm-9", name: "GLM 9", credit: 3.3 },
@@ -343,153 +397,226 @@ const RAW_LISTING = [
 ];
 
 test("mergeGatewayCatalog refreshes names/credits and keeps verified caps", () => {
-	const merged = mergeGatewayCatalog(RAW_LISTING);
+	const merged = mergeGatewayCatalog(RAW_LISTING, BASE);
 	assert.equal(merged.length, 4, "auto entry skipped");
 	const flash = merged.find((m) => m.id === "deepseek-v4-flash")!;
 	assert.deepEqual(flash.cost, { input: 0.4, output: 0.4, cacheRead: 0, cacheWrite: 0 });
 	assert.equal(flash.maxTokens, 393_216, "verified cap preserved");
 	assert.equal(flash.contextWindow, 1_000_000);
+	assert.equal(flash.provider, PROVIDER_ID);
+	assert.equal(flash.baseUrl, BASE);
 	const kimi = merged.find((m) => m.id === "kimi-k3")!;
 	assert.equal(kimi.name, "Kimi K3", "static name kept when listing has none");
 	assert.equal(kimi.cost.input, 4.51, "static credit kept when listing has none");
 });
 
 test("mergeGatewayCatalog auto-registers unknown models conservatively", () => {
-	const merged = mergeGatewayCatalog(RAW_LISTING);
+	const merged = mergeGatewayCatalog(RAW_LISTING, BASE);
 	const glm9 = merged.find((m) => m.id === "glm-9")!;
 	assert.equal(glm9.api, "openai-completions");
 	assert.deepEqual(glm9.input, ["text"]);
 	assert.equal(glm9.reasoning, true);
 	assert.equal(glm9.cost.input, 3.3);
 	assert.equal(glm9.contextWindow, 128_000);
+	assert.equal(glm9.baseUrl, BASE);
 	assert.deepEqual(Object.values(glm9.thinkingLevelMap ?? {}), [null, null, null, null, null, null, null]);
 });
 
 test("mergeGatewayCatalog falls back to static catalog on junk listings", () => {
-	assert.equal(mergeGatewayCatalog([]).length, CATALOG.length);
-	assert.equal(mergeGatewayCatalog([{ id: "auto" }]).length, CATALOG.length);
-	assert.equal(mergeGatewayCatalog([{} as never, { id: 42 } as never]).length, CATALOG.length);
+	assert.equal(mergeGatewayCatalog([], BASE).length, CATALOG.length);
+	assert.equal(mergeGatewayCatalog([{ id: "auto" }], BASE).length, CATALOG.length);
+	assert.equal(mergeGatewayCatalog([{} as never, { id: 42 } as never], BASE).length, CATALOG.length);
 });
 
 test("unknownModelConfig defaults", () => {
-	const model = unknownModelConfig("new-model", "  New Model  ", 2);
+	const model = unknownModelConfig("new-model", BASE, "  New Model  ", 2);
 	assert.equal(model.id, "new-model");
 	assert.equal(model.name, "New Model");
 	assert.equal(model.cost.input, 2);
-	const nameless = unknownModelConfig("x");
+	assert.equal(model.provider, PROVIDER_ID);
+	const nameless = unknownModelConfig("x", BASE);
 	assert.equal(nameless.name, "x");
 	assert.equal(nameless.cost.input, 0);
 });
 
 // ---------------------------------------------------------------------------
-// refreshGatewayModels
+// fetchGatewayModels + provider.refreshModels (pi-ai wrapper integration)
 // ---------------------------------------------------------------------------
 
-function refreshContext(overrides: Partial<GatewayRefreshContext> = {}): {
-	ctx: GatewayRefreshContext;
-	published: { persist?: unknown; update?: () => void }[];
-} {
-	const published: { persist?: unknown; update?: () => void }[] = [];
-	const ctx: GatewayRefreshContext = {
+function refreshContext(overrides: Record<string, unknown> = {}) {
+	const published: any[] = [];
+	const ctx = {
 		credential: { type: "api_key", key: "test-key" },
 		stored: undefined,
-		publish: async (publication) => {
+		publish: async (publication: any) => {
 			published.push(publication);
+			publication.update?.();
 			return true;
 		},
 		allowNetwork: true,
+		force: true,
 		signal: new AbortController().signal,
 		...overrides,
-	};
+	} as any;
 	return { ctx, published };
 }
 
-function fetchStub(response: { ok: boolean; status?: number; body?: unknown } | Error) {
-	const calls: { url: string; init?: RequestInit }[] = [];
-	const impl = (async (url: string, init?: RequestInit) => {
-		calls.push({ url, init });
-		if (response instanceof Error) throw response;
-		return {
-			ok: response.ok,
-			status: response.status ?? (response.ok ? 200 : 500),
-			json: async () => response.body,
-		} as unknown as Response;
-	}) as typeof fetch;
-	return { impl, calls };
-}
-
-test("refresh: offline restores nothing new and never fetches", async () => {
-	const { impl, calls } = fetchStub({ ok: true, body: { data: RAW_LISTING } });
-	const { ctx } = refreshContext({ allowNetwork: false });
-	const models = await refreshGatewayModels(ctx, {}, impl);
-	assert.equal(models.length, CATALOG.length, "static catalog");
-	assert.equal(calls.length, 0);
-});
-
-test("refresh: offline uses persisted catalog when present", async () => {
-	const stored = {
-		models: [{ ...CATALOG[0]!, provider: PROVIDER_ID, cost: { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 } }],
-		checkedAt: Date.now(),
-	};
-	const { impl, calls } = fetchStub({ ok: true, body: { data: RAW_LISTING } });
-	const { ctx } = refreshContext({ allowNetwork: false, stored });
-	const models = await refreshGatewayModels(ctx, {}, impl);
-	assert.equal(models.length, 1);
-	assert.equal(models[0]!.cost.input, 9);
-	assert.equal(calls.length, 0);
-});
-
-test("refresh: fresh cache short-circuits the network", async () => {
-	const { impl, calls } = fetchStub({ ok: true, body: { data: RAW_LISTING } });
-	const { ctx } = refreshContext({ stored: { models: [], checkedAt: Date.now() } });
-	const models = await refreshGatewayModels(ctx, {}, impl);
-	assert.equal(models.length, CATALOG.length, "empty stored list falls back to static");
-	assert.equal(calls.length, 0);
-});
-
-test("refresh: fetches, merges, persists and sends bearer auth", async () => {
-	const { impl, calls } = fetchStub({ ok: true, body: { data: RAW_LISTING } });
-	const { ctx, published } = refreshContext();
-	const models = await refreshGatewayModels(ctx, { VOLCEAPI_BASE_URL: "https://gw.example/v1/" }, impl);
+test("fetchGatewayModels: fetches, merges and sends bearer auth", async () => {
+	const { impl, calls } = fetchStub({ status: 200, body: { data: RAW_LISTING } });
+	const { ctx } = refreshContext();
+	const models = await fetchGatewayModels(ctx, "https://gw.test/v1", impl);
 	assert.equal(calls.length, 1);
-	assert.equal(calls[0]!.url, "https://gw.example/v1/models");
+	assert.equal(calls[0]!.url, "https://gw.test/v1/models");
 	assert.deepEqual((calls[0]!.init?.headers as Record<string, string>).Authorization, "Bearer test-key");
 	assert.equal(models.length, 4);
 	assert.equal(models.find((m) => m.id === "deepseek-v4-flash")!.cost.input, 0.4);
-	assert.equal(published.length, 1);
-	const persist = published[0]!.persist as { models: { provider: string; baseUrl: string }[]; checkedAt: number };
-	assert.equal(persist.models.length, 4);
-	assert.equal(persist.models[0]!.provider, PROVIDER_ID);
-	assert.equal(persist.models[0]!.baseUrl, "https://gw.example/v1");
-	assert.ok(Date.now() - persist.checkedAt < 5_000);
 });
 
-test("refresh: stale cache forces a fetch", async () => {
-	const { impl, calls } = fetchStub({ ok: true, body: { data: RAW_LISTING } });
-	const stored = { models: [{ ...CATALOG[0]!, provider: PROVIDER_ID }], checkedAt: Date.now() - 13 * 60 * 60 * 1000 };
-	const { ctx } = refreshContext({ stored });
-	const models = await refreshGatewayModels(ctx, {}, impl);
-	assert.equal(calls.length, 1);
-	assert.equal(models.length, 4);
-});
-
-test("refresh: network failures degrade to cached/static list", async () => {
+test("fetchGatewayModels: degrades to static catalog on any failure", async () => {
 	for (const stub of [
 		fetchStub(new Error("network down")),
-		fetchStub({ ok: false, status: 502 }),
-		fetchStub({ ok: true, body: { data: [] } }),
-		fetchStub({ ok: true, body: { nope: true } }),
+		fetchStub({ status: 502 }),
+		fetchStub({ status: 200, body: { data: [] } }),
+		fetchStub({ status: 200, body: { nope: true } }),
 	]) {
 		const { ctx } = refreshContext();
-		const models = await refreshGatewayModels(ctx, {}, stub.impl);
+		const models = await fetchGatewayModels(ctx, BASE, stub.impl);
 		assert.equal(models.length, CATALOG.length);
+		assert.ok(models.every((m) => m.provider === PROVIDER_ID));
 	}
+	const { ctx } = refreshContext({ credential: { type: "oauth" } });
+	const { impl, calls } = fetchStub({ status: 200, body: { data: RAW_LISTING } });
+	assert.equal((await fetchGatewayModels(ctx, BASE, impl)).length, CATALOG.length);
+	assert.equal(calls.length, 0, "no key -> no fetch");
 });
 
-test("refresh: without an api-key credential nothing is fetched", async () => {
-	const { impl, calls } = fetchStub({ ok: true, body: { data: RAW_LISTING } });
-	const { ctx } = refreshContext({ credential: { type: "oauth" } });
-	const models = await refreshGatewayModels(ctx, {}, impl);
-	assert.equal(calls.length, 0);
+test("provider.refreshModels: offline start restores persisted overlay", async () => {
+	const { impl, calls } = fetchStub({ status: 200, body: { data: RAW_LISTING } });
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl: impl });
+	const storedFlash = { ...buildModels(BASE)[0]!, cost: { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 } };
+	const { ctx } = refreshContext({ allowNetwork: false, stored: { models: [storedFlash], checkedAt: Date.now() } });
+	await (provider as any).refreshModels(ctx);
+	assert.equal(calls.length, 0, "offline never fetches");
+	const models = provider.getModels();
 	assert.equal(models.length, CATALOG.length);
+	assert.equal(models.find((m) => m.id === storedFlash.id)!.cost.input, 9, "stored overlay applied");
+});
+
+test("provider.refreshModels: network run persists merged catalog", async () => {
+	const { impl, calls } = fetchStub({ status: 200, body: { data: RAW_LISTING } });
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl: impl });
+	const { ctx, published } = refreshContext();
+	await (provider as any).refreshModels(ctx);
+	assert.equal(calls.length, 1);
+	const persisted = published.map((p) => p.persist).filter(Boolean);
+	assert.equal(persisted.length, 1);
+	assert.equal(persisted[0].models.length, 4);
+	assert.equal(typeof persisted[0].checkedAt, "number");
+	const models = provider.getModels();
+	assert.ok(models.find((m) => m.id === "glm-9"), "new gateway model added");
+	assert.equal(models.find((m) => m.id === "deepseek-v4-flash")!.cost.input, 0.4, "credits refreshed");
+});
+
+// ---------------------------------------------------------------------------
+// key validation + login flow
+// ---------------------------------------------------------------------------
+
+test("validateGatewayKey: 400 means the key authenticated (zero inference)", async () => {
+	const { impl, calls } = fetchStub({ status: 400, body: "AI request body should have string model field." });
+	const result = await validateGatewayKey("secret-key-value", { baseUrl: BASE, fetchImpl: impl });
+	assert.deepEqual(result, { status: "valid" });
+	assert.equal(calls[0]!.url, `${BASE}/responses`);
+	assert.equal(calls[0]!.init?.method, "POST");
+	assert.equal(calls[0]!.init?.body, "{}");
+	assert.deepEqual((calls[0]!.init?.headers as Record<string, string>).Authorization, "Bearer secret-key-value");
+	assert.doesNotMatch(JSON.stringify(result), /secret-key-value/);
+});
+
+test("validateGatewayKey: status matrix", async () => {
+	const cases: [StubResponse, string][] = [
+		[{ status: 200 }, "valid"],
+		[{ status: 401 }, "invalid"],
+		[{ status: 403 }, "invalid"],
+		[{ status: 500 }, "unavailable"],
+		[new Error("network unavailable"), "unavailable"],
+	];
+	for (const [stub, expected] of cases) {
+		const { impl } = fetchStub(stub);
+		const result = await validateGatewayKey("k", { baseUrl: BASE, fetchImpl: impl });
+		assert.equal(result.status, expected, JSON.stringify(stub));
+		assert.doesNotMatch(JSON.stringify(result), /"k"/, "key never appears in results");
+	}
+	const { impl } = fetchStub({ status: 503 });
+	assert.match((await validateGatewayKey("k", { baseUrl: BASE, fetchImpl: impl })).reason ?? "", /HTTP 503/);
+});
+
+test("login: validates the key and stores it", async () => {
+	const { impl } = fetchStub({ status: 400 });
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl: impl });
+	const { interaction, prompts, notices } = fakeInteraction(["  good-key  "]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.deepEqual(credential, { type: "api_key", key: "good-key" });
+	assert.equal(prompts.length, 1);
+	assert.equal(prompts[0]!.type, "secret");
+	assert.ok(notices.some((n) => n.message.includes("validated")), "success notification");
+});
+
+test("login: re-prompts after an invalid key", async () => {
+	const { impl, calls } = fetchStub([{ status: 401 }, { status: 400 }]);
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl: impl });
+	const { interaction, prompts, notices } = fakeInteraction(["bad-key", "good-key"]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.deepEqual(credential, { type: "api_key", key: "good-key" });
+	assert.equal(prompts.filter((p) => p.type === "secret").length, 2);
+	assert.equal(calls.length, 2);
+	assert.ok(notices.some((n) => n.message.includes("rejected")), "rejection notification");
+});
+
+test("login: unreachable gateway offers retry and save-anyway", async () => {
+	const { impl } = fetchStub([new Error("connect ECONNREFUSED"), { status: 400 }]);
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl: impl });
+	const { interaction, prompts } = fakeInteraction(["key-1", "retry"]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.deepEqual(credential, { type: "api_key", key: "key-1" });
+	assert.deepEqual(prompts.map((p) => p.type), ["secret", "select"]);
+});
+
+test("login: save-without-validation escape hatch", async () => {
+	const { impl } = fetchStub(new Error("connect ECONNREFUSED"));
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl: impl });
+	const { interaction, prompts } = fakeInteraction(["key-2", "save"]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.deepEqual(credential, { type: "api_key", key: "key-2" });
+	assert.deepEqual(prompts.map((p) => p.type), ["secret", "select"]);
+});
+
+test("login: empty input re-prompts without wasting a validation call", async () => {
+	const { impl, calls } = fetchStub({ status: 400 });
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE, fetchImpl: impl });
+	const { interaction, prompts } = fakeInteraction(["   ", "key-3"]);
+	const credential = await provider.auth.apiKey!.login!(interaction as any);
+	assert.equal(credential.key, "key-3");
+	assert.equal(prompts.filter((p) => p.type === "secret").length, 2);
+	assert.equal(calls.length, 1);
+});
+
+test("auth check/resolve: stored credential wins over env", async () => {
+	const provider = createVolcengineGatewayProvider({ baseUrl: BASE });
+	const check = provider.auth.apiKey!.check!;
+	const resolve = provider.auth.apiKey!.resolve!;
+	const signal = new AbortController().signal;
+	const ctx = fakeAuthContext({ VOLCEAPI_API_KEY: " env-key " });
+
+	const stored = await check({ ctx, credential: { type: "api_key", key: "stored-key" }, signal });
+	assert.deepEqual(stored, { type: "api_key", source: "stored credential (Pi auth.json)" });
+	const fromEnv = await check({ ctx, signal });
+	assert.deepEqual(fromEnv, { type: "api_key", source: "$VOLCEAPI_API_KEY" });
+	assert.equal(await check({ ctx: fakeAuthContext({}), signal }), undefined);
+
+	const resolvedStored = await resolve({ ctx, credential: { type: "api_key", key: "stored-key" }, signal });
+	assert.equal(resolvedStored?.auth.apiKey, "stored-key");
+	const resolvedEnv = await resolve({ ctx, signal });
+	assert.equal(resolvedEnv?.auth.apiKey, "env-key", "env value trimmed");
+	assert.equal(resolvedEnv?.source, "$VOLCEAPI_API_KEY");
+	assert.equal(await resolve({ ctx: fakeAuthContext({}), signal }), undefined);
 });
