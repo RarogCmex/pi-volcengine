@@ -24,12 +24,13 @@
   },
   "files": [
     "index.ts",
+    "settings.ts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "tsx --test test/provider.test.ts",
+    "test": "tsx --test test/provider.test.ts test/settings.test.ts",
     "check": "npm run typecheck && npm run test"
   },
   "pi": {

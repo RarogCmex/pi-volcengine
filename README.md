@@ -12,8 +12,9 @@
 pi install /path/to/pi-volcengine        # локальная папка
 # или
 pi install git:<repo>@main               # из git
-# или просто скопируйте index.ts в ~/.pi/agent/extensions/
 ```
+
+Расширение состоит из двух файлов (`index.ts` импортирует `./settings.ts`) — копируйте пакет целиком, отдельный `index.ts` в `~/.pi/agent/extensions/` работать не будет.
 
 ## Авторизация
 
@@ -40,6 +41,19 @@ export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com
 ```
 
 Выбор модели: `/model` → `volcengine-gateway/<id>`; список: `pi --list-models volcengine` (показывается только при разрешённой авторизации).
+
+## Настройки внутри pi — `/volcengine`
+
+По аналогии с pi-nvidia-plus: одна команда с деревом подкоманд, автодополнение аргументов (Tab), персистентные настройки в `~/.pi/agent/volcengine-gateway.json` и виджет в status-баре.
+
+| Команда | Действие |
+|---|---|
+| `/volcengine status` | Base URL, источник ключа (stored/env), режим кэша, размер каталога, текущая модель |
+| `/volcengine cache on\|off\|status` | 24h prompt-cache retention без глобального `PI_CACHE_RETENTION=long`: хук инжектит `prompt_cache_retention:"24h"` (+ `prompt_cache_key` на chat-маршрутах) только в 12 проверенных маршруты; 3 строгие модели не трогаются никогда. Настройка сохраняется в файл и подхватывается мгновенно |
+| `/volcengine keys check` | Валидация текущего ключа zero-inference зондом (400 = валиден, 401/403 = отклонён, сеть недоступна = статус неизвестен) |
+| `/volcengine models refresh` | Принудительный `GET /v1/models` (force, provider-scoped) → слияние с каталогом → persist в `~/.pi/agent/models-store.json` |
+
+Приоритет режима кэша: `PI_CACHE_RETENTION=long` (env) > настройка `/volcengine cache`. Если pi уже отправил `prompt_cache_retention` (env-режим), хук ничего не добавляет. Виджет в status-баре: `volc:cache-long` (+ `(n/a)`, если текущая модель не принимает 24h); обновляется на `session_start`, `model_select`, `thinking_level_select`.
 
 ## Модели
 
@@ -100,10 +114,11 @@ export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com
 | kimi-k2.7-code, kimi-k3, MiniMax-M3, hy3, zhipu/glm-5.3 (chat) | ✅ 200 |
 | deepseek-v4-flash, doubao-seed-2.1-pro, glm-5.2 (responses) | ❌ `json: unknown field` — флаг выключен, pi им ничего не шлёт |
 
-Включить 24-часовой кэш (имеет смысл для длинных сессий с перерывами):
+Включить 24-часовой кэш (имеет смысл для длинных сессий с перерывами) — либо только для этого провайдера, либо глобально:
 
-```bash
-export PI_CACHE_RETENTION=long
+```
+/volcengine cache on        # per-provider, сохраняется в ~/.pi/agent/volcengine-gateway.json
+export PI_CACHE_RETENTION=long   # глобально для всех провайдеров pi
 ```
 
 Стоимость cache-read в каталоге тарифицируется по input-рейту (скидку кэша шлюз не публикует); `cached_tokens` из usage попадают в `usage.cacheRead` pi автоматически.
@@ -112,8 +127,9 @@ export PI_CACHE_RETENTION=long
 
 ```bash
 npm install
-npm run check        # tsc --noEmit + tsx --test (36 офлайн-тестов: каталог, хуки,
+npm run check        # tsc --noEmit + tsx --test (56 офлайн-тестов: каталог, хуки,
                      # merge/fetch, retention-матрица на уровне payload,
+                     # store настроек, /volcengine-команды, виджет,
                      # валидация ключа, login-флоу, check/resolve)
 ```
 

@@ -12,5 +12,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.ts", "test/**/*.ts"]
+  "include": ["index.ts", "settings.ts", "test/**/*.ts"]
 }

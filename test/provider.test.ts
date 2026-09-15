@@ -32,14 +32,17 @@ interface FakePi {
 	pi: {
 		registerProvider: (nameOrProvider: unknown, config?: unknown) => void;
 		on: (event: string, handler: (...args: never[]) => unknown) => void;
+		registerCommand: (name: string, options: unknown) => void;
 	};
 	providers: Map<string, AnyProvider>;
 	handlers: Map<string, ((...args: unknown[]) => unknown)[]>;
+	commands: Map<string, unknown>;
 }
 
 function createFakePi(): FakePi {
 	const providers = new Map<string, AnyProvider>();
 	const handlers = new Map<string, ((...args: unknown[]) => unknown)[]>();
+	const commands = new Map<string, unknown>();
 	return {
 		pi: {
 			registerProvider(nameOrProvider: unknown, config?: unknown) {
@@ -51,9 +54,13 @@ function createFakePi(): FakePi {
 				list.push(handler as (...args: unknown[]) => unknown);
 				handlers.set(event, list);
 			},
+			registerCommand(name: string, options: unknown) {
+				commands.set(name, options);
+			},
 		},
 		providers,
 		handlers,
+		commands,
 	};
 }
 

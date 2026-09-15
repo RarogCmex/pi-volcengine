@@ -77,6 +77,11 @@
  * Usage:
  *   pi                        # /login volcengine-gateway, then /model
  *   export VOLCEAPI_API_KEY=… # alternative to /login
+ *   /volcengine status        # in-pi settings: base URL, key, cache, catalog
+ *   /volcengine cache on      # persist 24h prompt-cache retention (verified
+ *                             # routes only); PI_CACHE_RETENTION=long also works
+ *   /volcengine keys check    # validate the resolved key against the gateway
+ *   /volcengine models refresh# force GET /v1/models catalog refresh
  */
 
 import {
@@ -90,6 +95,18 @@ import {
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi, openAIResponsesApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	applyCacheRetention,
+	completeArgs,
+	formatCommandLine,
+	loadSettings,
+	parseCacheArg,
+	saveSettings,
+	settingsPath,
+	volcengineCommands,
+	type CacheRetentionMode,
+	type VolcengineSettings,
+} from "./settings.ts";
 
 export const PROVIDER_ID = "volcengine-gateway";
 export const DEFAULT_BASE_URL = "https://YOUR-GATEWAY-ID.apigateway-cn-beijing.volceapi.com/v1";
@@ -718,15 +735,93 @@ export function normalizeOverflowError(errorMessage: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// extension entry point
+// extension entry point (provider + hooks + /volcengine settings command)
 // ---------------------------------------------------------------------------
 
-export default function volcengineGateway(pi: ExtensionAPI): void {
-	pi.registerProvider(createVolcengineGatewayProvider());
+type CompatFlags = { supportsLongCacheRetention?: boolean };
 
-	pi.on("before_provider_request", (event) => {
-		const rewritten = rewriteProviderPayload(event.payload);
-		return rewritten === undefined ? undefined : (rewritten as typeof event.payload);
+/** Routes that accepted `prompt_cache_retention:"24h"` (probe 2026-09-15). */
+export const RETENTION_MODELS: ReadonlySet<string> = new Set(
+	CATALOG.filter((m) => (m.compat as CompatFlags).supportsLongCacheRetention === true).map((m) => m.id),
+);
+
+/** Routes that reject the field with "json: unknown field" — never send it. */
+export const NO_RETENTION_MODELS: ReadonlySet<string> = new Set(
+	CATALOG.filter((m) => (m.compat as CompatFlags).supportsLongCacheRetention === false).map((m) => m.id),
+);
+
+const STATUS_KEY = "volcengine-gateway";
+
+/** Structural subset of pi's ExtensionContext/ExtensionCommandContext — keeps
+ *  this module testable with plain fakes (same seam style as pi-nvidia-plus). */
+export interface VolcCtx {
+	hasUI: boolean;
+	ui: {
+		notify(message: string, type?: "info" | "warning" | "error"): void;
+		setStatus(key: string, text: string | undefined): void;
+	};
+	model: { id: string; provider: string; api?: string } | undefined;
+	signal: AbortSignal | undefined;
+	modelRegistry: {
+		getAll(): readonly { id: string; provider: string }[];
+		getProviderAuthStatus(provider: string): { configured: boolean; source?: string; label?: string };
+		getApiKeyForProvider(provider: string): Promise<string | undefined>;
+		refresh(options?: {
+			allowNetwork?: boolean;
+			providers?: readonly string[];
+			force?: boolean;
+			signal?: AbortSignal;
+		}): Promise<{ aborted: boolean; errors: ReadonlyMap<string, Error> }>;
+	};
+	sessionManager?: { getSessionId(): string };
+}
+
+export interface VolcengineExtensionOptions {
+	/** Settings file override (tests); default ~/.pi/agent/volcengine-gateway.json. */
+	settingsFile?: string;
+	/** fetch override (tests) used by the key-check command. */
+	fetchImpl?: typeof fetch;
+}
+
+export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineExtensionOptions = {}): void {
+	const settingsFile = options.settingsFile ?? settingsPath();
+	const fetchImpl = options.fetchImpl ?? fetch;
+	let settings: VolcengineSettings = loadSettings(settingsFile);
+
+	function effectiveCacheRetention(): { mode: CacheRetentionMode; source: "env" | "settings" } {
+		// PI_CACHE_RETENTION=long (pi-wide env) wins; the setting covers the
+		// gateway models even when the env is not set.
+		if (process.env.PI_CACHE_RETENTION?.trim().toLowerCase() === "long") return { mode: "long", source: "env" };
+		return { mode: settings.cacheRetention, source: "settings" };
+	}
+
+	function updateStatusWidget(ctx: VolcCtx): void {
+		if (!ctx.hasUI) return;
+		const model = ctx.model;
+		if (!model || model.provider !== PROVIDER_ID) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			return;
+		}
+		const { mode } = effectiveCacheRetention();
+		const note = mode === "long" && !RETENTION_MODELS.has(model.id) ? " (n/a)" : "";
+		ctx.ui.setStatus(STATUS_KEY, `volc:cache-${mode}${note}`);
+	}
+
+	pi.registerProvider(createVolcengineGatewayProvider({ fetchImpl }));
+
+	pi.on("before_provider_request", (event, ctx) => {
+		let payload: unknown = event.payload;
+		// 1) settings-driven 24h cache retention (no-op when pi already sent it)
+		const retention = applyCacheRetention(payload, {
+			enabled: effectiveCacheRetention().mode === "long",
+			supportedModels: RETENTION_MODELS,
+			sessionId: (ctx as VolcCtx)?.sessionManager?.getSessionId?.(),
+		});
+		if (retention !== undefined) payload = retention;
+		// 2) per-model quirk fixes (reasoning.summary strip, MiniMax adaptive)
+		const rewritten = rewriteProviderPayload(payload);
+		if (rewritten !== undefined) payload = rewritten;
+		return payload === event.payload ? undefined : (payload as typeof event.payload);
 	});
 
 	pi.on("message_end", (event, ctx) => {
@@ -736,5 +831,138 @@ export default function volcengineGateway(pi: ExtensionAPI): void {
 		const rewritten = normalizeOverflowError(message.errorMessage ?? "");
 		if (rewritten === null) return;
 		return { message: { ...message, errorMessage: rewritten } };
+	});
+
+	pi.on("session_start", (_event, ctx) => updateStatusWidget(ctx as VolcCtx));
+	pi.on("model_select", (_event, ctx) => updateStatusWidget(ctx as VolcCtx));
+	pi.on("thinking_level_select", (_event, ctx) => updateStatusWidget(ctx as VolcCtx));
+
+	// ── /volcengine subcommands ─────────────────────────────────────────────
+
+	const cmdStatus = async (_args: string, ctx: VolcCtx): Promise<void> => {
+		const auth = ctx.modelRegistry.getProviderAuthStatus(PROVIDER_ID);
+		const count = ctx.modelRegistry.getAll().filter((m) => m.provider === PROVIDER_ID).length;
+		const { mode, source } = effectiveCacheRetention();
+		const current = ctx.model
+			? ctx.model.provider === PROVIDER_ID
+				? `${ctx.model.id} (${ctx.model.api}${RETENTION_MODELS.has(ctx.model.id) ? "" : ", no 24h"})`
+				: `${ctx.model.provider}/${ctx.model.id} (other provider)`
+			: "none";
+		ctx.ui.notify(
+			[
+				"volcengine-gateway",
+				`base URL: ${resolveBaseUrl()}`,
+				auth.configured
+					? `key: configured (${auth.source ?? "unknown source"})`
+					: "key: MISSING — /login volcengine-gateway or $VOLCEAPI_API_KEY",
+				`cache retention: ${mode} (${source === "env" ? "PI_CACHE_RETENTION=long" : settingsFile})`,
+				`models: ${count}`,
+				`current: ${current}`,
+			].join("\n"),
+			"info",
+		);
+	};
+
+	const cmdCache = async (args: string, ctx: VolcCtx): Promise<void> => {
+		const parsed = parseCacheArg(args);
+		if (parsed === undefined) {
+			ctx.ui.notify(`Unknown cache mode "${args.trim()}" — use: cache [on|off|status]`, "warning");
+			return;
+		}
+		if (parsed === "status") {
+			const { mode, source } = effectiveCacheRetention();
+			ctx.ui.notify(
+				[
+					`cache retention: ${mode} (${source === "env" ? "PI_CACHE_RETENTION=long env" : `settings: ${settingsFile}`})`,
+					`24h routes (${RETENTION_MODELS.size}): ${[...RETENTION_MODELS].join(", ")}`,
+					`no 24h (${NO_RETENTION_MODELS.size}): ${[...NO_RETENTION_MODELS].join(", ")} — gateway rejects the field`,
+				].join("\n"),
+				"info",
+			);
+			return;
+		}
+		settings = saveSettings({ cacheRetention: parsed }, settingsFile);
+		const envLong = process.env.PI_CACHE_RETENTION?.trim().toLowerCase() === "long";
+		const note = parsed === "short" && envLong ? " — note: PI_CACHE_RETENTION=long env still forces 24h" : "";
+		ctx.ui.notify(
+			`${parsed === "long" ? "24h cache retention enabled" : "Cache retention back to pi defaults"} (saved to ${settingsFile})${note}`,
+			"info",
+		);
+		updateStatusWidget(ctx);
+	};
+
+	const cmdKeys = async (args: string, ctx: VolcCtx): Promise<void> => {
+		const sub = args.trim().toLowerCase();
+		if (sub !== "check") {
+			ctx.ui.notify(
+				sub ? `Unknown keys subcommand "${sub}" — use: keys check` : "Usage: keys check — validate the resolved gateway key",
+				"warning",
+			);
+			return;
+		}
+		const key = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+		if (!key) {
+			ctx.ui.notify("No API key resolved — run /login volcengine-gateway or set $VOLCEAPI_API_KEY", "warning");
+			return;
+		}
+		ctx.ui.notify("Checking key against the gateway (zero-inference probe)…", "info");
+		const result = await validateGatewayKey(key, { baseUrl: resolveBaseUrl(), fetchImpl, signal: ctx.signal });
+		if (result.status === "valid") {
+			ctx.ui.notify("Gateway key is VALID (authenticated; 400 model-field probe).", "info");
+		} else if (result.status === "invalid") {
+			ctx.ui.notify("Gateway REJECTED the key (401/403) — re-run /login volcengine-gateway.", "error");
+		} else {
+			ctx.ui.notify(`Gateway unreachable (${result.reason ?? "network error"}) — key validity unknown.`, "warning");
+		}
+	};
+
+	const cmdModels = async (args: string, ctx: VolcCtx): Promise<void> => {
+		const sub = args.trim().toLowerCase();
+		if (sub !== "refresh") {
+			ctx.ui.notify(
+				sub
+					? `Unknown models subcommand "${sub}" — use: models refresh`
+					: "Usage: models refresh — re-pull GET /v1/models and persist the overlay",
+				"warning",
+			);
+			return;
+		}
+		ctx.ui.notify("Refreshing catalog from GET /v1/models…", "info");
+		const result = await ctx.modelRegistry.refresh({
+			allowNetwork: true,
+			providers: [PROVIDER_ID],
+			force: true,
+			signal: ctx.signal,
+		});
+		const error = result.errors.get(PROVIDER_ID);
+		const count = ctx.modelRegistry.getAll().filter((m) => m.provider === PROVIDER_ID).length;
+		if (error) {
+			ctx.ui.notify(`Catalog refresh failed (${error.message}) — kept previous catalog (${count} models).`, "warning");
+		} else {
+			ctx.ui.notify(`Catalog refreshed: ${count} models registered for ${PROVIDER_ID}.`, "info");
+		}
+	};
+
+	const runners: Record<string, (args: string, ctx: VolcCtx) => Promise<void>> = {
+		status: cmdStatus,
+		cache: cmdCache,
+		keys: cmdKeys,
+		models: cmdModels,
+	};
+
+	pi.registerCommand("volcengine", {
+		description: "Volcengine gateway settings: status, cache retention, key check, catalog refresh",
+		getArgumentCompletions: (prefix: string) => completeArgs(prefix, volcengineCommands()),
+		handler: async (args: string, ctx: VolcCtx) => {
+			const trimmed = (args ?? "").trim();
+			const [sub, ...rest] = trimmed.split(/\s+/).filter(Boolean);
+			const run = sub ? runners[sub] : undefined;
+			if (!run) {
+				const list = volcengineCommands().map(formatCommandLine).join("\n");
+				ctx.ui.notify(sub ? `Unknown command "${sub}".\n/volcengine:\n${list}` : `/volcengine:\n${list}`, "info");
+				return;
+			}
+			await run(rest.join(" "), ctx);
+		},
 	});
 }
