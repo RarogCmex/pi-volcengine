@@ -6,12 +6,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rarogcmex/pi-volcengine.git"
+    "url": "git+https://github.com/RarogCmex/pi-volcengine.git"
   },
   "bugs": {
-    "url": "https://github.com/rarogcmex/pi-volcengine/issues"
+    "url": "https://github.com/RarogCmex/pi-volcengine/issues"
   },
-  "homepage": "https://github.com/rarogcmex/pi-volcengine#readme",
+  "homepage": "https://github.com/RarogCmex/pi-volcengine#readme",
   "keywords": [
     "pi-package",
     "pi-extension",

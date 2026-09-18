@@ -9,7 +9,7 @@
 ## Установка
 
 ```bash
-pi install git:github.com/rarogcmex/pi-volcengine@main
+pi install git:github.com/RarogCmex/pi-volcengine@main
 # или локально
 pi install /path/to/pi-volcengine
 ```
