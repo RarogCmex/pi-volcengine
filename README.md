@@ -9,9 +9,9 @@
 ## Установка
 
 ```bash
-pi install /path/to/pi-volcengine        # локальная папка
-# или
-pi install git:<repo>@main               # из git
+pi install git:github.com/rarogcmex/pi-volcengine@main
+# или локально
+pi install /path/to/pi-volcengine
 ```
 
 Расширение состоит из двух файлов (`index.ts` импортирует `./settings.ts`) — копируйте пакет целиком, отдельный `index.ts` в `~/.pi/agent/extensions/` работать не будет.
@@ -26,7 +26,7 @@ pi install git:<repo>@main               # из git
 
 Расширение попросит consumer-ключ шлюза (UUID) и **проверит его до сохранения** zero-inference зондом (`POST {} → /responses`: 400 = ключ прошёл аутентификацию, 401 = отклонён). Ключ ляжет в `~/.pi/agent/auth.json`.
 
-**Смена Endpoint URL прямо во время login** (стартуем с дефолтного URL, предлагаем сменить на кастомный — у каждой подписки свой gateway-id, и валидный ключ чужой подписки на дефолтном шлюзе даст 401):
+**Смена Endpoint URL прямо во время login** (у каждой подписки свой gateway-id; если endpoint ещё не задан, login стартует на плейсхолдере и сразу предупреждает об этом, а валидный ключ чужой подписки на вашем шлюзе даст 401):
 
 - **401/403** → выбор: «Re-enter the API key» / «Change the endpoint URL…»;
 - **шлюз недоступен** → «Retry validation» / «Change the endpoint URL…» / «Save without validating»;
@@ -43,11 +43,13 @@ export VOLCEAPI_API_KEY="<ваш-consumer-key-UUID>"
 
 Сохранённый через `/login` ключ имеет приоритет над env. Порядок разрешения: stored credential → `$VOLCEAPI_API_KEY`.
 
-Base URL по умолчанию зашит в расширение; переопределяется через:
+**Base URL обязателен к настройке**: у каждой подписки volceapi.com свой gateway-id, поэтому в расширение зашит плейсхолдер (`https://YOUR-GATEWAY-ID.apigateway-cn-beijing.volceapi.com/v1`), а не рабочий хост. Укажите свой endpoint одним из способов:
 
 ```bash
 export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com/v1"
 ```
+
+или внутри pi: `/volcengine url set https://<ваш-id>.apigateway-cn-beijing.volceapi.com/v1` (кандидат сначала пробуется `GET /models`). Пока endpoint не задан, `/volcengine status` показывает предупреждение, а `/login` сразу предлагает ветку смены URL.
 
 Выбор модели: `/model` → `volcengine-gateway/<id>`; список: `pi --list-models volcengine` (показывается только при разрешённой авторизации).
 
@@ -59,7 +61,7 @@ export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com
 |---|---|
 | `/volcengine status` | Base URL (+ источник: env/settings/default), источник ключа (stored/env), режим кэша, размер каталога, текущая модель |
 | `/volcengine cache on\|off\|status` | 24h prompt-cache retention без глобального `PI_CACHE_RETENTION=long`: хук инжектит `prompt_cache_retention:"24h"` (+ `prompt_cache_key` на chat-маршрутах) только в 12 проверенных маршрутов; 3 строгие модели не трогаются никогда. Настройка сохраняется в файл и подхватывается мгновенно |
-| `/volcengine url status\|set\|check\|reset` | Оверрайд Endpoint URL + детект по образцу pi-alibaba-models. Приоритет: `$VOLCEAPI_BASE_URL` > сохранённый `baseUrl` > встроенный. `set <https://…>` сначала делает пробу `GET /models` текущим ключом: 200+листинг → сохраняет без вопросов; 401/403 или недоступность → confirm «Save anyway?» (в headless-режиме не сохраняет вовсе). `check [url]` — проба без сохранения, `reset` — сброс оверрайда. Сохранение перепривязывает провайдер и модели in-place (pi хранит те же ссылки на объекты моделей — `/reload` не нужен) |
+| `/volcengine url status\|set\|check\|reset` | Оверрайд Endpoint URL + детект по образцу pi-alibaba-models. Приоритет: `$VOLCEAPI_BASE_URL` > сохранённый `baseUrl` > встроенный плейсхолдер (не рабочий хост — см. «Авторизация»). `set <https://…>` сначала делает пробу `GET /models` текущим ключом: 200+листинг → сохраняет без вопросов; 401/403 или недоступность → confirm «Save anyway?» (в headless-режиме не сохраняет вовсе). `check [url]` — проба без сохранения, `reset` — сброс оверрайда. Сохранение перепривязывает провайдер и модели in-place (pi хранит те же ссылки на объекты моделей — `/reload` не нужен) |
 | `/volcengine keys check` | Валидация текущего ключа zero-inference зондом (400 = валиден, 401/403 = отклонён, сеть недоступна = статус неизвестен) |
 | `/volcengine models refresh` | Принудительный `GET /v1/models` (force, provider-scoped) → слияние с каталогом → persist в `~/.pi/agent/models-store.json` |
 

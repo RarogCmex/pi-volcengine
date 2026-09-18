@@ -3,7 +3,9 @@
  *
  * Endpoint: per-subscriber API Gateway URL, e.g.
  *           https://<id>.apigateway-cn-beijing.volceapi.com/v1
- *           (override with $VOLCEAPI_BASE_URL, or persist one via
+ *           The shipped DEFAULT_BASE_URL is a non-resolving placeholder —
+ *           no real endpoint can be baked into a public build — so callers
+ *           must set theirs via $VOLCEAPI_BASE_URL, or persist one via
  *           `/volcengine url set https://…` — the candidate is probed
  *           before saving, like pi-alibaba-models' endpoint detection)
  * Auth:     `pi /login volcengine-gateway` (key is validated against the
@@ -118,6 +120,11 @@ import {
 } from "./settings.ts";
 
 export const PROVIDER_ID = "volcengine-gateway";
+/** Shipped placeholder, NOT a working host: every volceapi.com subscription
+ *  gets its own gateway id, so no real endpoint can be baked into a public
+ *  build. Callers must supply one via $VOLCEAPI_BASE_URL or
+ *  `/volcengine url set …`. Kept URL-parseable on purpose (the settings store
+ *  and `normalizeBaseUrl` reject values `new URL()` cannot parse). */
 export const DEFAULT_BASE_URL = "https://YOUR-GATEWAY-ID.apigateway-cn-beijing.volceapi.com/v1";
 export const API_KEY_ENV = "VOLCEAPI_API_KEY";
 export const BASE_URL_ENV = "VOLCEAPI_BASE_URL";
@@ -149,6 +156,13 @@ export function baseUrlSource(
 	if (env[BASE_URL_ENV]?.trim()) return "env";
 	if (settings?.baseUrl?.trim()) return "settings";
 	return "default";
+}
+
+/** True when the effective endpoint is still the shipped placeholder — i.e. the
+ *  user has not configured their own gateway id yet, so every request will fail
+ *  DNS rather than with a meaningful gateway error. */
+export function isPlaceholderBaseUrl(url: string): boolean {
+	return url.replace(/\/+$/, "") === DEFAULT_BASE_URL.replace(/\/+$/, "");
 }
 
 type GatewayApi = "openai-responses" | "openai-completions";
@@ -788,9 +802,12 @@ export function createVolcengineGatewayProvider(options: VolcengineGatewayOption
 				name: "Volcengine Gateway API key",
 				async login(interaction) {
 					let url = currentBaseUrl();
+					// AuthEvent has no "warning" type — flag the unconfigured state in text.
 					interaction.notify({
 						type: "info",
-						message: `Gateway endpoint: ${url} — use the consumer API key issued with your volceapi.com subscription (a plain Ark key will not work). Wrong endpoint? You can switch it below if the key is rejected.`,
+						message: isPlaceholderBaseUrl(url)
+							? `⚠ No gateway endpoint configured — still on the placeholder ${url}, which cannot resolve. Every volceapi.com subscription has its own gateway id: choose "Change the endpoint URL…" below (or set $${BASE_URL_ENV}, or run /volcengine url set https://<your-id>.apigateway-cn-beijing.volceapi.com/v1).`
+							: `Gateway endpoint: ${url} — use the consumer API key issued with your volceapi.com subscription (a plain Ark key will not work). Wrong endpoint? You can switch it below if the key is rejected.`,
 					});
 					const changeEndpoint = async (key: string): Promise<boolean> => {
 						const next = await promptCustomEndpoint(interaction, url, key, {
@@ -1196,7 +1213,10 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 					`endpoint: ${ep.url}`,
 					`source: ${ep.source}${ep.source === "env" ? ` ($${BASE_URL_ENV})` : ep.source === "settings" ? ` (${settingsFile})` : " (built-in)"}`,
 					settings.baseUrl && ep.source === "env" ? `saved override (shadowed by env): ${settings.baseUrl}` : "",
-					`default: ${DEFAULT_BASE_URL}`,
+					`default: ${DEFAULT_BASE_URL}${isPlaceholderBaseUrl(DEFAULT_BASE_URL) ? " (placeholder — set your own gateway id)" : ""}`,
+					isPlaceholderBaseUrl(ep.url)
+						? "⚠ no endpoint configured — run: /volcengine url set https://<your-id>.apigateway-cn-beijing.volceapi.com/v1"
+						: "",
 					"probe with: /volcengine url check [https://…]",
 				]
 					.filter(Boolean)

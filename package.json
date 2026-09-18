@@ -4,6 +4,14 @@
   "description": "Pi provider extension for Volcengine API Gateway (volceapi.com) subscriptions: Responses API first, chat-completions fallback, dynamic model refresh.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rarogcmex/pi-volcengine.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rarogcmex/pi-volcengine/issues"
+  },
+  "homepage": "https://github.com/rarogcmex/pi-volcengine#readme",
   "keywords": [
     "pi-package",
     "pi-extension",

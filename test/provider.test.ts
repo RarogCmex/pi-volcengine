@@ -22,6 +22,7 @@ import extension, {
 	rewriteProviderPayload,
 	unknownModelConfig,
 	validateGatewayKey,
+	isPlaceholderBaseUrl,
 	type GatewayModelEntry,
 } from "../index.ts";
 import { loadSettings } from "../settings.ts";
@@ -684,6 +685,60 @@ test("login: re-prompts after an invalid key", async () => {
 	assert.equal(prompts.filter((p) => p.type === "secret").length, 2);
 	assert.equal(calls.length, 2);
 	assert.ok(notices.some((n) => n.message.includes("rejected")), "rejection notification");
+});
+
+// ── shipped default is a placeholder, never a real subscriber endpoint ────
+
+test("DEFAULT_BASE_URL is a non-resolving placeholder", () => {
+	assert.equal(isPlaceholderBaseUrl(DEFAULT_BASE_URL), true);
+	assert.match(DEFAULT_BASE_URL, /YOUR-GATEWAY-ID/);
+	// Must stay URL-parseable: normalizeBaseUrl/loadSettings reject anything
+	// `new URL()` cannot parse, so an unparseable default would break the store.
+	assert.doesNotThrow(() => new URL(DEFAULT_BASE_URL));
+	assert.equal(isPlaceholderBaseUrl(`${DEFAULT_BASE_URL}/`), true, "trailing slash normalized");
+	assert.equal(isPlaceholderBaseUrl(BASE), false);
+	assert.equal(isPlaceholderBaseUrl("https://real-id.apigateway-cn-beijing.volceapi.com/v1"), false);
+});
+
+test("no concrete subscriber gateway id is baked into the sources", async () => {
+	const { readFile } = await import("node:fs/promises");
+	// Per-subscriber gateway ids are private infrastructure identifiers: they
+	// must never be committed. Match on the offending host only so a failure
+	// prints the host, not the whole file.
+	const CONCRETE_GATEWAY_HOST = /https:\/\/(?!YOUR-GATEWAY-ID|<)([a-z0-9]{16,}\.apigateway)/;
+	for (const file of ["index.ts", "settings.ts", "README.md", "AGENTS.md"]) {
+		const text = await readFile(new URL(`../${file}`, import.meta.url), "utf8");
+		const hit = text.match(CONCRETE_GATEWAY_HOST);
+		assert.equal(hit, null, `${file} must not hardcode a concrete gateway host (found: ${hit?.[1] ?? ""})`);
+	}
+});
+
+test("login on the placeholder endpoint warns instead of probing a dead host", async () => {
+	const { impl } = fetchStub({ status: 400 });
+	// No baseUrl override → the effective endpoint is the shipped placeholder.
+	const provider = createVolcengineGatewayProvider({ fetchImpl: impl, settingsFile: isolatedSettingsFile() });
+	const { interaction, notices } = fakeInteraction(["good-key"]);
+	await provider.auth.apiKey!.login!(interaction as any);
+	assert.ok(
+		notices.some((n) => n.message.includes("No gateway endpoint configured")),
+		"placeholder state is surfaced up front",
+	);
+	assert.ok(
+		notices.some((n) => n.message.includes("Change the endpoint URL")),
+		"points at the endpoint-switch escape hatch",
+	);
+});
+
+test("login on a configured endpoint keeps the normal guidance", async () => {
+	const { impl } = fetchStub({ status: 400 });
+	const provider = loginProvider(impl, isolatedSettingsFile());
+	const { interaction, notices } = fakeInteraction(["good-key"]);
+	await provider.auth.apiKey!.login!(interaction as any);
+	assert.ok(notices.some((n) => n.message.includes(`Gateway endpoint: ${BASE}`)));
+	assert.ok(
+		!notices.some((n) => n.message.includes("No gateway endpoint configured")),
+		"no false alarm once configured",
+	);
 });
 
 // ── login-time endpoint switching (variant B) ──────────────────────────
