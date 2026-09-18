@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 import extension, {
 	BASE_URL_ENV,
@@ -26,11 +27,13 @@ import {
 	clampCacheKey,
 	completeArgs,
 	DEFAULT_SETTINGS,
+	envSetHint,
 	loadSettings,
 	normalizeBaseUrl,
 	parseCacheArg,
 	saveSettings,
 	settingsPath,
+	SETTINGS_FILE_NAME,
 	volcengineCommands,
 	type VolcengineSettings,
 } from "../settings.ts";
@@ -151,9 +154,11 @@ function fakeCtx(overrides: Record<string, unknown> = {}) {
 // settings store
 // ---------------------------------------------------------------------------
 
-test("settingsPath defaults under ~/.pi/agent", () => {
-	assert.equal(settingsPath("/base"), join("/base", "volcengine-gateway.json"));
-	assert.match(settingsPath(), /\.pi\/agent\/volcengine-gateway\.json$/);
+test("settingsPath resolves under pi's agent dir (portable, env-honoring)", () => {
+	assert.equal(settingsPath("/base"), join("/base", SETTINGS_FILE_NAME));
+	// Default base is getAgentDir(): $PI_CODING_AGENT_DIR or ~/.pi/agent.
+	// Compared via the host resolver + path.sep, so it holds on win32 too.
+	assert.equal(settingsPath(), join(getAgentDir(), SETTINGS_FILE_NAME));
 });
 
 test("loadSettings degrades to defaults on missing/corrupt/foreign files", () => {
@@ -698,7 +703,9 @@ test("/volcengine url set: rejected/unreachable probes go through confirm", asyn
 	await fake3.commands.get("volcengine")!.handler(`url set ${GOOD_URL}`, headless.ctx as never);
 	assert.equal(loadSettings(file3).baseUrl, undefined);
 	assert.match(headless.notifications.at(-1)!.message, /did not respond/);
-	assert.match(headless.notifications.at(-1)!.message, new RegExp(`answer in the TUI, or export ${BASE_URL_ENV}=`));
+	// Hint uses the platform-correct shell form (export on POSIX, $env: on win32).
+	const escaped = envSetHint(BASE_URL_ENV, GOOD_URL).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	assert.match(headless.notifications.at(-1)!.message, new RegExp(`answer in the TUI, or ${escaped}`));
 });
 
 test("/volcengine url set: invalid URL and interactive prompt paths", async () => {

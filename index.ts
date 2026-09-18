@@ -108,6 +108,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	applyCacheRetention,
 	completeArgs,
+	envSetHint,
 	formatCommandLine,
 	loadSettings,
 	normalizeBaseUrl,
@@ -1024,7 +1025,7 @@ export interface VolcCtx {
 }
 
 export interface VolcengineExtensionOptions {
-	/** Settings file override (tests); default ~/.pi/agent/volcengine-gateway.json. */
+	/** Settings file override (tests); default <agentDir>/volcengine-gateway.json (pi's getAgentDir). */
 	settingsFile?: string;
 	/** fetch override (tests) used by the key-check command. */
 	fetchImpl?: typeof fetch;
@@ -1294,7 +1295,7 @@ export default function volcengineGateway(pi: ExtensionAPI, options: VolcengineE
 		const described = describeProbe(probe, normalized);
 		const question = `${described.message} Save it anyway?`;
 		if (!ctx.hasUI) {
-			ctx.ui.notify(`${question} (answer in the TUI, or export ${BASE_URL_ENV}=${normalized})`, described.type);
+			ctx.ui.notify(`${question} (answer in the TUI, or ${envSetHint(BASE_URL_ENV, normalized)})`, described.type);
 			return;
 		}
 		const save = await ctx.ui.confirm("Unverified endpoint", question);

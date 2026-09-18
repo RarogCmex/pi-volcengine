@@ -1,0 +1,14 @@
+# Keep source LF in the repo regardless of core.autocrlf, so jiti/tsx and the
+# offline tests behave identically on Linux, macOS and Windows.
+* text=auto eol=lf
+
+*.ts text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.js text eol=lf
+
+# Never touch binaries
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary

@@ -41,6 +41,8 @@ pi install /path/to/pi-volcengine
 export VOLCEAPI_API_KEY="<ваш-consumer-key-UUID>"
 ```
 
+PowerShell (Windows): `$env:VOLCEAPI_API_KEY="<ваш-consumer-key-UUID>"`.
+
 Сохранённый через `/login` ключ имеет приоритет над env. Порядок разрешения: stored credential → `$VOLCEAPI_API_KEY`.
 
 **Base URL обязателен к настройке**: у каждой подписки volceapi.com свой gateway-id, поэтому в расширение зашит плейсхолдер (`https://YOUR-GATEWAY-ID.apigateway-cn-beijing.volceapi.com/v1`), а не рабочий хост. Укажите свой endpoint одним из способов:
@@ -48,6 +50,8 @@ export VOLCEAPI_API_KEY="<ваш-consumer-key-UUID>"
 ```bash
 export VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com/v1"
 ```
+
+PowerShell (Windows): `$env:VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn-beijing.volceapi.com/v1"`. Конфиг pi берётся из `$PI_CODING_AGENT_DIR` (по умолчанию `~/.pi/agent`), файл настроек — `<agentDir>/volcengine-gateway.json`.
 
 или внутри pi: `/volcengine url set https://<ваш-id>.apigateway-cn-beijing.volceapi.com/v1` (кандидат сначала пробуется `GET /models`). Пока endpoint не задан, `/volcengine status` показывает предупреждение, а `/login` сразу предлагает ветку смены URL.
 

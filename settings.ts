@@ -1,12 +1,13 @@
 /**
  * In-pi settings for the Volcengine gateway provider.
  *
- * Pattern follows pi-nvidia-plus: a small JSON store under ~/.pi/agent,
- * a single `/volcengine` slash command with a subcommand tree + pure
- * autocomplete, and pure payload helpers that index.ts wires into
+ * Pattern follows pi-nvidia-plus: a small JSON store under pi's agent config
+ * dir (`getAgentDir()`: $PI_CODING_AGENT_DIR, else ~/.pi/agent), a single
+ * `/volcengine` slash command with a subcommand tree + pure autocomplete,
+ * and pure payload helpers that index.ts wires into
  * `before_provider_request`.
  *
- * Store file: ~/.pi/agent/volcengine-gateway.json
+ * Store file: <agentDir>/volcengine-gateway.json  (default ~/.pi/agent/…)
  *   { "version": 1, "cacheRetention": "long" | "short",
  *     "baseUrl": "https://…/v1", "updatedAt": "..." }
  *
@@ -21,8 +22,8 @@
  * the hook is a no-op.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
 // settings store
@@ -41,7 +42,11 @@ export interface VolcengineSettings {
 export const SETTINGS_FILE_NAME = "volcengine-gateway.json";
 export const DEFAULT_SETTINGS: VolcengineSettings = { version: 1, cacheRetention: "short" };
 
-export function settingsPath(baseDir: string = join(homedir(), ".pi", "agent")): string {
+/** Agent config dir from the host, so $PI_CODING_AGENT_DIR and rebranded
+ *  distributions (custom CONFIG_DIR_NAME) are honored instead of a hardcoded
+ *  `~/.pi/agent`. Resolved per call (default parameter), not at import time.
+ *  Inside pi this module instance is already loaded, so the import is free. */
+export function settingsPath(baseDir: string = getAgentDir()): string {
 	return join(baseDir, SETTINGS_FILE_NAME);
 }
 
@@ -102,6 +107,19 @@ export function saveSettings(
 	mkdirSync(dirname(file), { recursive: true });
 	writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
 	return next;
+}
+
+/**
+ * Platform-correct shell snippet for exporting an env var, used in user-facing
+ * hints. win32 → PowerShell (`$env:NAME="value"`); elsewhere → POSIX `export`.
+ * Pure: `platform` is injectable for tests.
+ */
+export function envSetHint(
+	name: string,
+	value: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	return platform === "win32" ? `$env:${name}="${value}"` : `export ${name}=${value}`;
 }
 
 /** `cache` subcommand argument parsing: on/long/24h → long, off/short → short. */
