@@ -145,7 +145,7 @@ export PI_CACHE_RETENTION=long   # глобально для всех прова
 
 ```bash
 npm install
-npm run check        # tsc --noEmit + tsx --test (76 офлайн-тестов: каталог, хуки,
+npm run check        # tsc --noEmit + tsx --test (80 офлайн-тестов: каталог, хуки,
                      # merge/fetch, retention-матрица на уровне payload,
                      # store настроек, /volcengine-команды, endpoint-оверрайд
                      # и probe-детект, виджет, валидация ключа, login-флоу)
