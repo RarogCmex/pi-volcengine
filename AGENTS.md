@@ -7,6 +7,7 @@
 - `index.ts` — всё расширение: каталог моделей, `createProvider`, хуки `before_provider_request` / `message_end`, команда `/volcengine`.
 - `settings.ts` — JSON-стор настроек (`<agentDir>/volcengine-gateway.json`, где agentDir = `getAgentDir()` хоста: `$PI_CODING_AGENT_DIR` или `~/.pi/agent`).
 - `test/` — офлайн-тесты (`node:test` через tsx).
+- `research/` — непроверенные находки из доков провайдера (датированы). Это **не** источник фактов для каталога: значение попадает в `index.ts`/README только после живой пробы.
 - `inspiration-sources/` — **чужие расширения-образцы, не часть проекта**. Не редактировать, не импортировать, не запускать их тесты; в сборку и tsconfig не входят.
 
 ## Проверка

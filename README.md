@@ -174,3 +174,7 @@ PI_CACHE_RETENTION=long pi -ne -e ./index.ts -p --model volcengine-gateway/qwen3
 - Контексты `glm-5.3`, `zhipu/glm-5.3`, `doubao-seed-2.1-pro`, `kimi-*`, `MiniMax-M3` взяты из эталонных Ark-расширений и проб; если реальное окно маршрута меньше, сработает авто-компакция через хук нормализации.
 - `deepseek-v4-flash`, `doubao-seed-2.1-pro`, `glm-5.2` не принимают `prompt_cache_retention` — для них 24h-удержание недоступно (обычный кэш работает).
 - Тарификация кредитов приблизительная (1 credit ≈ $1/1M токенов, cache-read = input-рейт); точная бухгалтерия — в панели Volcengine.
+
+## TODO
+
+- Доки Ark / API Gateway обновлялись после верификации каталога 2026-09-15 (vision `xhigh`/`image_pixel_limit`, DeepSeek-V4.1-Flash, Seed-Evolving, AI Model Fallback от 2026-09-10): сводка и чек-лист живых проб — в [research/2026-09-22-ark-gateway-docs.md](research/2026-09-22-ark-gateway-docs.md). До верификации живым ключом каталог не менять (AGENTS.md).
