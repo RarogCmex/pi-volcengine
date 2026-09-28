@@ -1,5 +1,5 @@
 {
-  "name": "pi-volcengine",
+  "name": "@rarogcmex/pi-volcengine",
   "version": "0.1.0",
   "description": "Pi provider extension for Volcengine API Gateway (volceapi.com) subscriptions: Responses API first, chat-completions fallback, dynamic model refresh.",
   "type": "module",
@@ -56,5 +56,8 @@
     "@types/node": "24.6.2",
     "tsx": "4.20.6",
     "typescript": "5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
