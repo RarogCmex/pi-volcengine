@@ -1,6 +1,19 @@
 # pi-volcengine
 
-Расширение-провайдер для [pi coding agent](https://github.com/earendil-works/pi), подключающее подписку **Volcengine API Gateway** (`*.apigateway-cn-beijing.volceapi.com`).
+Расширение-провайдер для [pi coding agent](https://github.com/earendil-works/pi), подключающее подписку **Volcengine API Gateway** (`*.apigateway-cn-beijing.volceapi.com`). npm-имя пакета — `@rarogcmex/pi-volcengine`.
+
+> **In English.** pi-volcengine registers a **Volcengine API Gateway**
+> subscription (`*.apigateway-cn-beijing.volceapi.com`) as a native pi provider
+> under the id `volcengine-gateway`. The preferred wire protocol is the OpenAI
+> **Responses API** (`store:false`, streaming, tool calling, reasoning replays);
+> models whose upstreams do not serve Responses on this gateway fall back to Chat
+> Completions. Install with
+> `pi install git:github.com/RarogCmex/pi-volcengine@main`, then set your
+> per-subscription endpoint (`$VOLCEAPI_BASE_URL` or `/volcengine url set …`) and
+> authenticate with `/login volcengine-gateway`. Every model parameter — effort
+> values, token limits, vision, thinking format — was verified against the live
+> gateway on 2026-09-15. The rest of this README is in Russian; code comments and
+> the npm metadata are in English.
 
 Приоритетный протокол — **OpenAI Responses API** (`/v1/responses`, stateless `store:false`, стриминг, tool calling, reasoning-реплеи). Модели, чьи апстримы не поддерживают Responses на этом шлюзе, работают через **Chat Completions** (`/v1/chat/completions`).
 
@@ -55,17 +68,17 @@ PowerShell (Windows): `$env:VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn
 
 или внутри pi: `/volcengine url set https://<ваш-id>.apigateway-cn-beijing.volceapi.com/v1` (кандидат сначала пробуется `GET /models`). Пока endpoint не задан, `/volcengine status` показывает предупреждение, а `/login` сразу предлагает ветку смены URL.
 
-Выбор модели: `/model` → `volcengine-gateway/<id>`; список: `pi --list-models volcengine` (показывается только при разрешённой авторизации).
+Выбор модели: `/model` → `volcengine-gateway/<id>`; список: `pi --list-models volcengine-gateway` (id провайдера — `volcengine-gateway`, не `volcengine`; показывается только при разрешённой авторизации).
 
 ## Настройки внутри pi — `/volcengine`
 
-По аналогии с pi-nvidia-plus: одна команда с деревом подкоманд, автодополнение аргументов (Tab), персистентные настройки в `~/.pi/agent/volcengine-gateway.json` и виджет в status-баре.
+Одна команда с деревом подкоманд, автодополнение аргументов (Tab), персистентные настройки в `~/.pi/agent/volcengine-gateway.json` и виджет в status-баре.
 
 | Команда | Действие |
 |---|---|
 | `/volcengine status` | Base URL (+ источник: env/settings/default), источник ключа (stored/env), режим кэша, размер каталога, текущая модель |
 | `/volcengine cache on\|off\|status` | 24h prompt-cache retention без глобального `PI_CACHE_RETENTION=long`: хук инжектит `prompt_cache_retention:"24h"` (+ `prompt_cache_key` на chat-маршрутах) только в 12 проверенных маршрутов; 3 строгие модели не трогаются никогда. Настройка сохраняется в файл и подхватывается мгновенно |
-| `/volcengine url status\|set\|check\|reset` | Оверрайд Endpoint URL + детект по образцу pi-alibaba-models. Приоритет: `$VOLCEAPI_BASE_URL` > сохранённый `baseUrl` > встроенный плейсхолдер (не рабочий хост — см. «Авторизация»). `set <https://…>` сначала делает пробу `GET /models` текущим ключом: 200+листинг → сохраняет без вопросов; 401/403 или недоступность → confirm «Save anyway?» (в headless-режиме не сохраняет вовсе). `check [url]` — проба без сохранения, `reset` — сброс оверрайда. Сохранение перепривязывает провайдер и модели in-place (pi хранит те же ссылки на объекты моделей — `/reload` не нужен) |
+| `/volcengine url status\|set\|check\|reset` | Оверрайд Endpoint URL: кандидат пробуется до сохранения, а не после. Приоритет: `$VOLCEAPI_BASE_URL` > сохранённый `baseUrl` > встроенный плейсхолдер (не рабочий хост — см. «Авторизация»). `set <https://…>` сначала делает пробу `GET /models` текущим ключом: 200+листинг → сохраняет без вопросов; 401/403 или недоступность → confirm «Save anyway?» (в headless-режиме не сохраняет вовсе). `check [url]` — проба без сохранения, `reset` — сброс оверрайда. Сохранение перепривязывает провайдер и модели in-place (pi хранит те же ссылки на объекты моделей — `/reload` не нужен) |
 | `/volcengine keys check` | Валидация текущего ключа zero-inference зондом (400 = валиден, 401/403 = отклонён, сеть недоступна = статус неизвестен) |
 | `/volcengine models refresh` | Принудительный `GET /v1/models` (force, provider-scoped) → слияние с каталогом → persist в `~/.pi/agent/models-store.json` |
 
@@ -75,7 +88,7 @@ PowerShell (Windows): `$env:VOLCEAPI_BASE_URL="https://<ваш-id>.apigateway-cn
 
 ## Модели
 
-`credit` — множитель тарификации шлюза из `GET /v1/models` (≈ $/1M токенов; меняется со временем — см. `credit_history`). Цены в pi отображаются приблизительно по этому множителю.
+`credit` — множитель тарификации шлюза из `GET /v1/models` (≈ $/1M токенов). Цены в pi отображаются приблизительно по этому множителю. Множитель **меняется со временем**: расширение читает из листинга только `id`, `name` и `credit` (`GatewayModelEntry` в `index.ts`) и при каждом обновлении каталога берёт свежее значение, но историю изменений шлюза не хранит и не показывает — точная бухгалтерия доступна только в панели Volcengine.
 
 ### Responses API (приоритет)
 
@@ -143,6 +156,12 @@ export PI_CACHE_RETENTION=long   # глобально для всех прова
 
 ## Разработка
 
+Предварительные условия: **Node ≥ 22.19** (`engines` в `package.json`). Здесь
+`npm install` действительно ставит всё нужное: `@earendil-works/pi-ai`,
+`@earendil-works/pi-coding-agent`, `@types/node`, `tsx` и `typescript` объявлены
+как `devDependencies` (линейка 0.87.0, на которой расширение проверено), а
+`package-lock.json` закоммичен — симлинки на глобальную установку pi не нужны.
+
 ```bash
 npm install
 npm run check        # tsc --noEmit + tsx --test (80 офлайн-тестов: каталог, хуки,
@@ -171,10 +190,18 @@ PI_CACHE_RETENTION=long pi -ne -e ./index.ts -p --model volcengine-gateway/qwen3
 ## Известные ограничения
 
 - `encrypted_content` шлюзом не выдаётся — reasoning между ходами передаётся как summary-текст (для stateless-режима этого достаточно).
-- Контексты `glm-5.3`, `zhipu/glm-5.3`, `doubao-seed-2.1-pro`, `kimi-*`, `MiniMax-M3` взяты из эталонных Ark-расширений и проб; если реальное окно маршрута меньше, сработает авто-компакция через хук нормализации.
+- Контексты `glm-5.3`, `zhipu/glm-5.3`, `doubao-seed-2.1-pro`, `kimi-*`, `MiniMax-M3` взяты из официальных Ark-маршрутов и проб, а не из ответа самого шлюза: там, где шлюз не раскрыл окно своей 400-ошибкой, значение осталось справочным. Если реальное окно маршрута меньше, сработает авто-компакция через хук нормализации.
 - `deepseek-v4-flash`, `doubao-seed-2.1-pro`, `glm-5.2` не принимают `prompt_cache_retention` — для них 24h-удержание недоступно (обычный кэш работает).
 - Тарификация кредитов приблизительная (1 credit ≈ $1/1M токенов, cache-read = input-рейт); точная бухгалтерия — в панели Volcengine.
 
-## TODO
+### Каталог отстаёт от доков Ark (на 2026-09-22)
 
-- Доки Ark / API Gateway обновлялись после верификации каталога 2026-09-15 (vision `xhigh`/`image_pixel_limit`, DeepSeek-V4.1-Flash, Seed-Evolving, AI Model Fallback от 2026-09-10): сводка и чек-лист живых проб — в [research/2026-09-22-ark-gateway-docs.md](research/2026-09-22-ark-gateway-docs.md). До верификации живым ключом каталог не менять (AGENTS.md).
+Доки Ark / API Gateway обновлялись после верификации каталога 2026-09-15:
+заявлены vision-параметры `xhigh` / `image_pixel_limit`, DeepSeek-V4.1-Flash,
+Seed-Evolving и AI Model Fallback (2026-09-10). Сводка и чек-лист живых проб —
+в [`research/2026-09-22-ark-gateway-docs.md`](research/2026-09-22-ark-gateway-docs.md)
+(файл есть в репозитории на GitHub, но **не входит в npm-тарбол**: `files` в
+`package.json` перечисляет только `index.ts`, `settings.ts`, `README.md`,
+`LICENSE`). Ни одно из этих изменений в каталог не внесено: правило расширения —
+значение попадает в `index.ts` и README только после живой пробы
+(см. [`AGENTS.md`](AGENTS.md)).

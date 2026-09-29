@@ -1,7 +1,7 @@
 /**
  * In-pi settings for the Volcengine gateway provider.
  *
- * Pattern follows pi-nvidia-plus: a small JSON store under pi's agent config
+ * Shape: a small JSON store under pi's agent config
  * dir (`getAgentDir()`: $PI_CODING_AGENT_DIR, else ~/.pi/agent), a single
  * `/volcengine` slash command with a subcommand tree + pure autocomplete,
  * and pure payload helpers that index.ts wires into
@@ -11,9 +11,8 @@
  *   { "version": 1, "cacheRetention": "long" | "short",
  *     "baseUrl": "https://…/v1", "updatedAt": "..." }
  *
- * `baseUrl` is a persisted endpoint override (same role as planOpenAI/
- * planAnthropic in pi-alibaba-models): $VOLCEAPI_BASE_URL env wins over it,
- * the built-in default applies when neither is set.
+ * `baseUrl` is a persisted endpoint override: $VOLCEAPI_BASE_URL env wins over
+ * it, and the built-in default applies when neither is set.
  *
  * `cacheRetention: "long"` makes the payload hook inject
  * `prompt_cache_retention: "24h"` (+ `prompt_cache_key` on chat routes) for

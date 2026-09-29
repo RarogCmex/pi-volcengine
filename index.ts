@@ -7,7 +7,7 @@
  *           no real endpoint can be baked into a public build — so callers
  *           must set theirs via $VOLCEAPI_BASE_URL, or persist one via
  *           `/volcengine url set https://…` — the candidate is probed
- *           before saving, like pi-alibaba-models' endpoint detection)
+ *           before saving, so a typo cannot persist a dead endpoint)
  * Auth:     `pi /login volcengine-gateway` (key is validated against the
  *           gateway before it is saved, stored in ~/.pi/agent/auth.json)
  *           or $VOLCEAPI_API_KEY. The login flow starts on the effective
@@ -70,14 +70,14 @@
  * Context windows / max output tokens: from gateway 400-error caps where
  * available (kimi 262144/1048576, MiniMax 524288, zhipu 131072, hy3 input
  * 192000, deepseek-v4-flash 393216, doubao 262144, glm 131072, qwen3.7
- * 131072), otherwise from the official Ark routes of the reference extensions.
+ * 131072), otherwise from the official Ark route documentation.
  *
  * Billing: the gateway reports a per-model `credit` multiplier via
  * GET /v1/models (changes over time — credit_history). 1 credit ≈ $1 per 1M
  * tokens (scale-matched against public Ark pricing); costs below use the
  * credits observed on 2026-09-15. Cache reads are priced at the input rate
- * (cached_tokens confirmed in usage; gateway billing split unknown — same
- * convention as the reference volc extensions). When the network is allowed, pi refreshes
+ * (cached_tokens confirmed in usage; the gateway does not publish its billing
+ * split, so cache reads use the input rate). When the network is allowed, pi refreshes
  * the catalog via fetchModels (GET /v1/models): fresh names/credits, new
  * gateway models auto-registered with conservative defaults, persisted to
  * pi's models store for offline starts. The dynamic overlay upserts over the
@@ -137,9 +137,9 @@ const FETCH_TIMEOUT_MS = 10_000;
 
 /**
  * Effective endpoint: $VOLCEAPI_BASE_URL env > persisted settings override
- * (`/volcengine url set`) > built-in default. Same precedence stance as
- * pi-alibaba-models' resolvePlanEndpoints (explicit source beats config,
- * config beats default).
+ * (`/volcengine url set`) > built-in default. An explicit source beats persisted
+ * config, and config beats the default — so a shell override always wins without
+ * having to edit the settings file, and `url reset` restores the default.
  */
 export function resolveBaseUrl(
 	env: NodeJS.ProcessEnv = process.env,
@@ -503,7 +503,7 @@ export interface GatewayModelEntry {
 	credit?: unknown;
 }
 
-/** Conservative registration for gateway models this build has never seen. */
+/** Conservative registration for gateway models this catalog has never seen. */
 export function unknownModelConfig(id: string, baseUrl: string, name?: string, credit?: number): Model<GatewayApi> {
 	return {
 		id,
@@ -629,7 +629,8 @@ export async function validateGatewayKey(key: string, options: ValidateKeyOption
 }
 
 // ---------------------------------------------------------------------------
-// endpoint detection (probe before switching — pi-alibaba-models pattern)
+// endpoint detection (probe before switching, so a typo cannot persist a dead
+// endpoint)
 // ---------------------------------------------------------------------------
 
 const ENDPOINT_PROBE_TIMEOUT_MS = 8_000;
@@ -998,7 +999,7 @@ export const NO_RETENTION_MODELS: ReadonlySet<string> = new Set(
 const STATUS_KEY = "volcengine-gateway";
 
 /** Structural subset of pi's ExtensionContext/ExtensionCommandContext — keeps
- *  this module testable with plain fakes (same seam style as pi-nvidia-plus). */
+ *  this module testable with plain fakes instead of a real pi instance. */
 export interface VolcCtx {
 	hasUI: boolean;
 	ui: {
