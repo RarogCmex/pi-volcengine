@@ -159,7 +159,9 @@ export PI_CACHE_RETENTION=long   # глобально для всех прова
 Предварительные условия: **Node ≥ 22.19** (`engines` в `package.json`). Здесь
 `npm install` действительно ставит всё нужное: `@earendil-works/pi-ai`,
 `@earendil-works/pi-coding-agent`, `@types/node`, `tsx` и `typescript` объявлены
-как `devDependencies` (линейка 0.87.0, на которой расширение проверено), а
+как `devDependencies` (линейка 0.87.0, на которой расширение проверено; отдельно
+прогнано на pi 0.99.1 — 2026-09-30, в клоне с подменой двух pi-пакетов на
+глобальные: typecheck + 80/80 зелёные, пинн в этом дереве остаётся 0.87.0), а
 `package-lock.json` закоммичен — симлинки на глобальную установку pi не нужны.
 
 ```bash
