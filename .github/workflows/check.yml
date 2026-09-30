@@ -121,7 +121,17 @@ jobs:
           ')
           echo "pi-ai из бандла свежего pi: $PIAI"
           npm install --no-save --no-package-lock "@earendil-works/pi-ai@$PIAI"
-          npm ls --depth=0 @earendil-works/pi-coding-agent @earendil-works/pi-ai
+          # Версии печатаем чтением package.json, а НЕ `npm ls`: после подмены
+          # с --no-save дерево расходится с package.json (там пинн 0.87.0), npm
+          # объявляет его invalid и возвращает ELSPROBLEMS — при set -e это
+          # красило шаг на ровном месте (прогон 2026-09-30, вторая итерация).
+          node -e '
+            const fs = require("fs");
+            for (const p of ["pi-coding-agent", "pi-ai"]) {
+              const f = `node_modules/@earendil-works/${p}/package.json`;
+              console.log(p, JSON.parse(fs.readFileSync(f, "utf8")).version);
+            }
+          '
 
       - name: Typecheck and test against the latest host
         run: npm run check
