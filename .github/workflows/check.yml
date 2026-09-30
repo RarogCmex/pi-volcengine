@@ -1,0 +1,101 @@
+---
+# Зачем это нужно. `peerDependencies` здесь намеренно `*` — так велят доки pi
+# (`docs/packages.md`), поэтому новый pi молча загрузит расширение и дрейф хоста
+# возможен без единого коммита здесь. Это не гипотеза: 2026-09-30 pi 0.87.1 →
+# 0.99.1 изменил то, как тело ошибки доезжает до адаптера, и три теста
+# pi-fuelix покраснели; нашлось случайно, еженедельное расписание ниже ловит
+# такое само.
+#
+# Отличие этой репы от остальных в семействе: хост здесь — настоящая
+# `devDependencies` (pi 0.87.0, TypeScript 5.9.3, `package-lock.json`
+# закоммичен), симлинков на глобальную установку нет. Поэтому две job'ы:
+#   pinned — `npm ci`, то есть ровно поддерживаемая конфигурация;
+#   latest — то же, но два pi-пакета заменены на свежие: это и есть детектор дрейфа.
+# На 2026-09-30 обе зелёные (pinned — в рабочем дереве, latest — в клоне с
+# подменой пакетов: typecheck + все тесты).
+#
+# Прогоняется только офлайн-набор; `live/` требует ключ и тратит реальные кредиты.
+name: check
+
+"on":
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    # Понедельник 03:17 UTC.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pinned:
+    name: pinned host (npm ci)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 — нижняя граница `engines`, 26 — то, на чём расширение разрабатывалось;
+        # обе прогнаны локально 2026-09-30.
+        node: ["22", "26"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install pinned dependencies
+        run: npm ci
+
+      - name: Show what is being tested
+        run: |
+          node --version
+          npm ls --depth=0 @earendil-works/pi-coding-agent @earendil-works/pi-ai typescript
+
+      - name: Typecheck and test
+        run: npm run check
+
+  latest:
+    name: latest host (drift catcher)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "26"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install pinned dependencies
+        run: npm ci
+
+      - name: Override the two pi packages with the latest release
+        # --no-save --no-package-lock: пинн в дереве остаётся прежним, подмена
+        # живёт только в этом раннере.
+        run: |
+          npm install --no-save --no-package-lock \
+            @earendil-works/pi-ai@latest @earendil-works/pi-coding-agent@latest
+          npm ls --depth=0 @earendil-works/pi-coding-agent @earendil-works/pi-ai
+
+      - name: Typecheck and test against the latest host
+        run: npm run check
