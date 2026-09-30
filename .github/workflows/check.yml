@@ -89,12 +89,38 @@ jobs:
       - name: Install pinned dependencies
         run: npm ci
 
-      - name: Override the two pi packages with the latest release
+      - name: Override the two pi packages with the latest published host
         # --no-save --no-package-lock: пинн в дереве остаётся прежним, подмена
         # живёт только в этом раннере.
+        #
+        # pi-ai берётся из бандла свежего pi, а НЕ из dist-tag `latest`: 2026-09-30
+        # `@earendil-works/pi-ai@latest` указывал на 0.99.2, чей тарбол отвечал
+        # 404 (0.99.1 при этом отдавался), и job падал на установке, а не на
+        # тестах. Пара «pi + та pi-ai, что он несёт» — это ровно то, что получает
+        # пользователь, поэтому она и правильная цель для проверки дрейфа.
+        #
+        # Если этот шаг красный — сначала смотрим, не E404/ETARGET ли это
+        # (реестр), и только потом подозреваем код: тесты идут следующим шагом.
         run: |
-          npm install --no-save --no-package-lock \
-            @earendil-works/pi-ai@latest @earendil-works/pi-coding-agent@latest
+          set -euo pipefail
+          npm install --no-save --no-package-lock @earendil-works/pi-coding-agent@latest
+          PIAI=$(node -e '
+            const fs = require("fs");
+            const cands = [
+              "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/package.json",
+              "node_modules/@earendil-works/pi-ai/package.json",
+            ];
+            for (const p of cands) {
+              if (fs.existsSync(p)) {
+                console.log(JSON.parse(fs.readFileSync(p, "utf8")).version);
+                process.exit(0);
+              }
+            }
+            console.error("pi-ai not found next to the freshly installed pi");
+            process.exit(1);
+          ')
+          echo "pi-ai из бандла свежего pi: $PIAI"
+          npm install --no-save --no-package-lock "@earendil-works/pi-ai@$PIAI"
           npm ls --depth=0 @earendil-works/pi-coding-agent @earendil-works/pi-ai
 
       - name: Typecheck and test against the latest host
