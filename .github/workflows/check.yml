@@ -89,48 +89,49 @@ jobs:
       - name: Install pinned dependencies
         run: npm ci
 
-      - name: Override the two pi packages with the latest published host
-        # --no-save --no-package-lock: пинн в дереве остаётся прежним, подмена
-        # живёт только в этом раннере.
+      - name: Point the repo at the latest published host (one matched copy)
+        # Почему не `npm install …@latest` поверх дерева. Первый вариант этого шага
+        # делал именно так и давал красный typecheck при полностью зелёных тестах:
+        # npm оставлял в дереве **две** копии pi-ai (нашу поверх + вложенную
+        # зависимость pi), и TypeScript сравнивал два номинально разных набора
+        # типов — `Provider<GatewayApi>` не присваивался `Provider<Api>`
+        # (TS2345, прогон 2026-09-30; те же деревья с одной парой — 157/157 и
+        # typecheck rc=0). Поэтому хост ставится в отдельный префикс и линкуется
+        # одной согласованной парой — тот же приём, что `scripts/link-pi.mjs`
+        # в остальных девяти репах семейства.
         #
-        # pi-ai берётся из бандла свежего pi, а НЕ из dist-tag `latest`: 2026-09-30
-        # `@earendil-works/pi-ai@latest` указывал на 0.99.2, чей тарбол отвечал
-        # 404 (0.99.1 при этом отдавался), и job падал на установке, а не на
-        # тестах. Пара «pi + та pi-ai, что он несёт» — это ровно то, что получает
-        # пользователь, поэтому она и правильная цель для проверки дрейфа.
-        #
-        # Если этот шаг красный — сначала смотрим, не E404/ETARGET ли это
-        # (реестр), и только потом подозреваем код: тесты идут следующим шагом.
+        # Если шаг красный — сначала смотрим на guard и версии ниже, и только
+        # потом подозреваем код: тесты идут следующим шагом.
         run: |
           set -euo pipefail
-          npm install --no-save --no-package-lock @earendil-works/pi-coding-agent@latest
-          PIAI=$(node -e '
-            const fs = require("fs");
-            const cands = [
-              "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/package.json",
-              "node_modules/@earendil-works/pi-ai/package.json",
-            ];
-            for (const p of cands) {
-              if (fs.existsSync(p)) {
-                console.log(JSON.parse(fs.readFileSync(p, "utf8")).version);
-                process.exit(0);
-              }
-            }
-            console.error("pi-ai not found next to the freshly installed pi");
-            process.exit(1);
-          ')
-          echo "pi-ai из бандла свежего pi: $PIAI"
-          npm install --no-save --no-package-lock "@earendil-works/pi-ai@$PIAI"
-          # Версии печатаем чтением package.json, а НЕ `npm ls`: после подмены
-          # с --no-save дерево расходится с package.json (там пинн 0.87.0), npm
-          # объявляет его invalid и возвращает ELSPROBLEMS — при set -e это
-          # красило шаг на ровном месте (прогон 2026-09-30, вторая итерация).
+          HOST=/tmp/pi-host
+          rm -rf "$HOST"; mkdir -p "$HOST"; cd "$HOST"
+          npm init --yes >/dev/null
+          npm install @earendil-works/pi-coding-agent@latest >/dev/null
+          cd "$GITHUB_WORKSPACE"
+
+          PI="$HOST/node_modules/@earendil-works/pi-coding-agent"
+          PIAI="$PI/node_modules/@earendil-works/pi-ai"
+          [ -d "$PIAI" ] || PIAI="$HOST/node_modules/@earendil-works/pi-ai"
+          [ -d "$PIAI" ] || { echo "::error::pi-ai not found next to the freshly installed pi"; exit 1; }
+
+          rm -rf node_modules/@earendil-works/pi-ai node_modules/@earendil-works/pi-coding-agent
+          ln -s "$PI" node_modules/@earendil-works/pi-coding-agent
+          ln -s "$PIAI" node_modules/@earendil-works/pi-ai
+
+          # guard: pi-ai в дереве обязана быть ТОЙ ЖЕ копией, что несёт сам pi.
+          # Иначе typecheck сравнивает два набора типов и врёт про несовместимость.
+          TOP_REAL=$(node -e 'console.log(require("fs").realpathSync("node_modules/@earendil-works/pi-ai"))')
+          HOST_REAL=$(node -e 'console.log(require("fs").realpathSync(process.argv[1]))' "$PIAI")
+          if [ "$TOP_REAL" != "$HOST_REAL" ]; then
+            echo "::error::pi-ai in the tree ($TOP_REAL) is not the copy pi bundles ($HOST_REAL)"
+            exit 1
+          fi
           node -e '
             const fs = require("fs");
-            for (const p of ["pi-coding-agent", "pi-ai"]) {
-              const f = `node_modules/@earendil-works/${p}/package.json`;
-              console.log(p, JSON.parse(fs.readFileSync(f, "utf8")).version);
-            }
+            const ver = (p) => JSON.parse(fs.readFileSync(p + "/package.json", "utf8")).version;
+            console.log("host under test: pi-coding-agent " + ver("node_modules/@earendil-works/pi-coding-agent")
+              + " + pi-ai " + ver("node_modules/@earendil-works/pi-ai") + " (one copy)");
           '
 
       - name: Typecheck and test against the latest host
