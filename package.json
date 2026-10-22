@@ -1,6 +1,6 @@
 {
   "name": "@rarogcmex/pi-volcengine",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pi provider extension for Volcengine API Gateway (volceapi.com) subscriptions: Responses API first, chat-completions fallback, dynamic model refresh.",
   "type": "module",
   "license": "MIT",
@@ -51,8 +51,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.0.4",
-    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
     "@types/node": "24.6.2",
     "tsx": "4.20.6",
     "typescript": "5.9.3"
